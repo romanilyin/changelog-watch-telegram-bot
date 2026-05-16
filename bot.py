@@ -25,6 +25,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import yaml
@@ -71,6 +72,10 @@ WEEKDAY_NAMES = {
     "вс": 6,
 }
 
+DEFAULT_DISPLAY_TIMEZONE = "Europe/Amsterdam"
+_display_tz_name = DEFAULT_DISPLAY_TIMEZONE
+_display_tz = ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+
 
 @dataclass(frozen=True)
 class SummarySchedule:
@@ -88,6 +93,39 @@ def normalize_alias(value: Any) -> str | None:
     if not alias:
         return None
     return alias.lower()
+
+
+def resolve_display_timezone() -> tuple[str, ZoneInfo]:
+    global _display_tz_name, _display_tz
+
+    configured_name = normalize_string(os.getenv("DISPLAY_TIMEZONE", _display_tz_name)) or DEFAULT_DISPLAY_TIMEZONE
+    if configured_name == _display_tz_name:
+        return configured_name, _display_tz
+
+    try:
+        resolved_tz = ZoneInfo(configured_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        LOG.warning("Invalid DISPLAY_TIMEZONE=%r: %s; fallback to %s", configured_name, exc, DEFAULT_DISPLAY_TIMEZONE)
+        configured_name = DEFAULT_DISPLAY_TIMEZONE
+        resolved_tz = ZoneInfo(configured_name)
+
+    _display_tz_name = configured_name
+    _display_tz = resolved_tz
+    return configured_name, resolved_tz
+
+
+def parse_delivery_mode(raw_mode: Any, context: str, *, send_summary: bool) -> str:
+    mode = normalize_string(raw_mode).lower()
+
+    if not mode:
+        return "instant" if not send_summary else "both"
+
+    if mode not in {"instant", "digest", "both", "none"}:
+        raise ValueError(
+            f"{context} delivery_mode must be one of instant|digest|both|none, got {mode!r}"
+        )
+
+    return mode
 
 
 @dataclass(frozen=True)
@@ -110,6 +148,7 @@ class ChatRouting:
     alias: str | None = None
     enabled: bool = True
     send_summary: bool = True
+    delivery_mode: str = "both"
     summary_schedule: SummarySchedule = field(default_factory=SummarySchedule.immediate)
     last_summary_sent_at: str | None = None
 
@@ -268,14 +307,15 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
         conn.execute(
             """
             INSERT INTO routing_chats(
-                chat_id, title, enabled, send_summary, alias,
+                chat_id, title, enabled, send_summary, delivery_mode, alias,
                 summary_mode, summary_time, summary_weekday
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
                 enabled = excluded.enabled,
                 send_summary = excluded.send_summary,
+                delivery_mode = excluded.delivery_mode,
                 alias = excluded.alias,
                 summary_mode = excluded.summary_mode,
                 summary_time = excluded.summary_time,
@@ -286,6 +326,7 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
                 chat.title,
                 int(chat.enabled),
                 int(chat.send_summary),
+                chat.delivery_mode,
                 chat.alias,
                 chat.summary_schedule.mode,
                 chat.summary_schedule.time,
@@ -467,8 +508,10 @@ def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
         mode = normalize_string(raw_schedule).lower()
         if not mode:
             return SummarySchedule.immediate()
-        if mode not in {"immediate", "on", "enabled", "true"}:
+        if mode not in {"immediate", "on", "enabled", "true", "none"}:
             raise ValueError(f"{context} summary schedule mode is invalid: {mode!r}")
+        if mode == "none":
+            return SummarySchedule(mode="none", time="00:00", weekday=None)
         return SummarySchedule.immediate()
 
     if not isinstance(raw_schedule, dict):
@@ -478,11 +521,13 @@ def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
     if not mode:
         mode = "immediate"
     mode = mode.lower()
-    if mode not in {"immediate", "daily", "weekly"}:
-        raise ValueError(f"{context} summary_schedule.mode must be one of immediate|daily|weekly: {mode!r}")
+    if mode not in {"immediate", "daily", "weekly", "none"}:
+        raise ValueError(f"{context} summary_schedule.mode must be one of immediate|daily|weekly|none: {mode!r}")
 
     if mode == "immediate":
         return SummarySchedule.immediate()
+    if mode == "none":
+        return SummarySchedule(mode="none", time="00:00", weekday=None)
 
     hour, minute = validate_summary_time(
         raw_schedule.get("time") or raw_schedule.get("at"),
@@ -526,6 +571,9 @@ def parse_sqlite_datetime(value: str | None) -> datetime | None:
 
 
 def is_summary_due(schedule: SummarySchedule, now: datetime, last_sent_at: str | None) -> bool:
+    if schedule.mode == "none":
+        return False
+
     if schedule.mode == "immediate":
         return True
 
@@ -666,6 +714,7 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
         enabled = bool(raw_chat.get("enabled", True))
         send_summary = bool(raw_chat.get("send_summary", True))
         summary_schedule = parse_summary_schedule(raw_chat.get("summary_schedule"), f"chats[{idx}]")
+        delivery_mode = parse_delivery_mode(raw_chat.get("delivery_mode"), f"chats[{idx}]", send_summary=send_summary)
 
         for existing_chat in chats.values():
             if existing_chat.alias and alias and existing_chat.alias == alias:
@@ -682,6 +731,7 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
             alias=alias,
             enabled=enabled,
             send_summary=send_summary,
+            delivery_mode=delivery_mode,
             summary_schedule=summary_schedule,
         )
 
@@ -753,6 +803,11 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
         title = normalize_string(raw_chat["title"]) or None
         enabled = bool(raw_chat["enabled"])
         send_summary = bool(raw_chat["send_summary"])
+        delivery_mode = parse_delivery_mode(
+            raw_chat["delivery_mode"] if "delivery_mode" in raw_chat.keys() else None,
+            f"chat {chat_id}",
+            send_summary=send_summary,
+        )
         alias = normalize_alias(raw_chat["alias"]) if raw_chat["alias"] is not None else None
         summary_schedule = parse_summary_schedule_from_db(raw_chat, chat_id)
         last_summary_sent_at = normalize_string(raw_chat["last_summary_sent_at"]) or None
@@ -772,6 +827,7 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
             alias=alias,
             enabled=enabled,
             send_summary=send_summary,
+            delivery_mode=delivery_mode,
             summary_schedule=summary_schedule,
             last_summary_sent_at=last_summary_sent_at,
         )
@@ -841,6 +897,40 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_weekday INTEGER")
     if "last_summary_sent_at" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN last_summary_sent_at TEXT")
+    delivery_mode_added = "delivery_mode" not in chat_columns
+
+    if delivery_mode_added:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'both'")
+
+    if delivery_mode_added:
+        conn.execute(
+            """
+            UPDATE routing_chats
+            SET delivery_mode = CASE
+                WHEN COALESCE(send_summary, 0) = 0 THEN 'instant'
+                ELSE 'both'
+            END
+            WHERE delivery_mode = 'both'
+            """
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deliveries (
+            source_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            sent_at TEXT,
+            last_attempt_at TEXT NOT NULL,
+            error TEXT,
+            PRIMARY KEY (source_id, item_id, chat_id),
+            FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_chat_status ON deliveries(chat_id, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_source_item ON deliveries(source_id, item_id)")
 
     conn.execute(
         """
@@ -908,7 +998,13 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
             chat_id TEXT PRIMARY KEY,
             title TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
-            send_summary INTEGER NOT NULL DEFAULT 1
+            send_summary INTEGER NOT NULL DEFAULT 1,
+            alias TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'both',
+            summary_mode TEXT NOT NULL DEFAULT 'immediate',
+            summary_time TEXT NOT NULL DEFAULT '00:00',
+            summary_weekday INTEGER,
+            last_summary_sent_at TEXT
         )
         """
     )
@@ -995,6 +1091,71 @@ def mark_many_posted(conn: sqlite3.Connection, source_id: str, entries: list[Cha
         VALUES(?, ?, ?)
         """,
         [(source_id, entry.item_id, now) for entry in entries],
+    )
+    conn.commit()
+
+
+def load_failed_delivery_item_ids(conn: sqlite3.Connection, chat_id: str, source_id: str) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT item_id
+        FROM deliveries
+        WHERE source_id = ? AND chat_id = ? AND status = 'failed'
+        ORDER BY rowid
+        """,
+        (source_id, chat_id),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def is_delivered_to_chat(conn: sqlite3.Connection, source_id: str, item_id: str, chat_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM deliveries
+        WHERE source_id = ? AND item_id = ? AND chat_id = ? AND status = 'sent'
+        """,
+        (source_id, item_id, chat_id),
+    ).fetchone()
+    return row is not None
+
+
+def mark_delivery_status(
+    conn: sqlite3.Connection,
+    source_id: str,
+    item_id: str,
+    chat_id: str,
+    sent: bool,
+    *,
+    error: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    status = "sent" if sent else "failed"
+    conn.execute(
+        """
+        INSERT INTO deliveries(
+            source_id,
+            item_id,
+            chat_id,
+            status,
+            sent_at,
+            last_attempt_at,
+            error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id, item_id, chat_id) DO UPDATE SET
+            status = excluded.status,
+            sent_at = COALESCE(excluded.sent_at, sent_at),
+            last_attempt_at = excluded.last_attempt_at,
+            error = excluded.error
+        """,
+        (
+            source_id,
+            item_id,
+            chat_id,
+            status,
+            now if sent else None,
+            now,
+            error,
+        ),
     )
     conn.commit()
 
@@ -1205,7 +1366,11 @@ def github_repo_from_url(url: str) -> tuple[str, str]:
 async def parse_github_releases(client: httpx.AsyncClient, source: dict[str, Any]) -> list[ChangelogEntry]:
     owner, repo = github_repo_from_url(source["url"])
     api_url = f"https://api.github.com/repos/{owner}/{repo}/releases"
-    response = await client.get(api_url, headers={"Accept": "application/vnd.github+json"})
+    headers = {"Accept": "application/vnd.github+json"}
+    github_token = os.getenv("GITHUB_TOKEN", "").strip()
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    response = await client.get(api_url, headers=headers)
     response.raise_for_status()
     releases = response.json()
 
@@ -1226,7 +1391,7 @@ async def parse_github_releases(client: httpx.AsyncClient, source: dict[str, Any
         published_at = release.get("published_at") or release.get("created_at")
         date = None
         if published_at:
-            date = to_gmt3(published_at)
+            date = to_display_timezone(published_at)
 
         title = release.get("name") or tag
         body = release.get("body") or ""
@@ -1347,13 +1512,13 @@ def compact_markdown_for_telegram(text: str) -> str:
     return text.strip()
 
 
-def to_gmt3(date_text: str) -> str:
-    # Convert only explicit UTC timestamps to readable GMT+3.
+def to_display_timezone(date_text: str) -> str:
+    """Convert explicit timestamps to configured display timezone."""
     date_text = date_text.strip()
-    explicit_utc = bool(
+    explicit_tz = bool(
         re.search(r"(?:\sUTC$|T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$|[+\-]\d{2}:\d{2}$)", date_text)
     )
-    if not explicit_utc:
+    if not explicit_tz:
         return date_text
 
     try:
@@ -1361,13 +1526,19 @@ def to_gmt3(date_text: str) -> str:
     except ValueError:
         return date_text
 
+    _, display_tz = resolve_display_timezone()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S GMT+3")
+    dt = dt.astimezone(display_tz)
+    return f"{dt:%Y-%m-%d %H:%M:%S} ({dt.tzname() or _display_tz_name})"
 
 
 def format_date_with_tz(date_text: str) -> str:
     text = date_text.strip()
+
+    if text.endswith(")") and "(" in text:
+        return text
+
     match = re.search(r"\s+(UTC|GMT[+-]\d{1,2}(?:\:?[0-9]{2})?|[+-]\d{2}:\d{2})$", text)
     if not match:
         return f"{text} (часовой пояс не указан)"
@@ -1448,6 +1619,25 @@ async def telegram_api_get_result(
         description = payload.get("description") if isinstance(payload, dict) else None
         raise RuntimeError(f"Telegram API method '{method}' failed: {description}")
     return payload.get("result")
+
+
+async def telegram_api_post_result(
+    client: httpx.AsyncClient,
+    token: str,
+    method: str,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    response = await client.post(
+        f"https://api.telegram.org/bot{token}/{method}",
+        json=payload or {},
+    )
+    response.raise_for_status()
+    result_payload = response.json()
+    if not isinstance(result_payload, dict) or not result_payload.get("ok"):
+        description = result_payload.get("description") if isinstance(result_payload, dict) else None
+        raise RuntimeError(f"Telegram API method '{method}' failed: {description}")
+    return result_payload.get("result")
 
 
 async def get_bot_user_id(client: httpx.AsyncClient, token: str) -> str:
@@ -1557,7 +1747,7 @@ async def run_admin_command_listener(
                     "timeout": poll_timeout,
                     "allowed_updates": ["message", "channel_post", "edited_message"],
                 }
-                updates = await telegram_api_get_result(client, telegram_token, "getUpdates", params=params)
+                updates = await telegram_api_post_result(client, telegram_token, "getUpdates", payload=params)
                 if not isinstance(updates, list):
                     updates = []
 
@@ -1694,15 +1884,12 @@ async def check_source(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
     source: dict[str, Any],
-    telegram_token: str,
-    telegram_chat_ids: list[str],
-    dry_run: bool,
-) -> list[ChangelogEntry]:
+) -> tuple[list[ChangelogEntry], list[ChangelogEntry]]:
     source_id = source["id"]
     entries = await parse_source(client, source)
     if not entries:
         LOG.warning("[%s] no entries found", source_id)
-        return []
+        return [], []
 
     initialized = is_source_initialized(conn, source_id)
 
@@ -1710,7 +1897,7 @@ async def check_source(
         mark_many_posted(conn, source_id, entries)
         mark_source_initialized(conn, source_id)
         LOG.info("[%s] initialized with %d existing entries; nothing posted", source_id, len(entries))
-        return []
+        return entries, []
 
     new_entries = [entry for entry in entries if not is_posted(conn, source_id, entry.item_id)]
 
@@ -1720,29 +1907,18 @@ async def check_source(
 
     if not new_entries:
         LOG.info("[%s] no new entries", source_id)
-        return []
+        if not initialized:
+            mark_many_posted(conn, source_id, entries)
+            mark_source_initialized(conn, source_id)
+        return entries, []
 
-    posted_entries: list[ChangelogEntry] = []
-
-    # Sources normally return newest first. Send oldest first if multiple appeared between polls.
-    for entry in reversed(new_entries):
-        msg = format_message(source, entry)
-        if not telegram_chat_ids:
-            LOG.info("[%s] no target chats configured for %s", source_id, entry.item_id)
-        for chat_id in telegram_chat_ids:
-            if dry_run:
-                LOG.info("[%s] DRY RUN would post %s to %s:\n%s", source_id, entry.item_id, chat_id, msg)
-            else:
-                await send_telegram_message(client, telegram_token, chat_id, msg)
-                LOG.info("[%s] posted %s to %s", source_id, entry.item_id, chat_id)
-        mark_posted(conn, source_id, entry.item_id)
-        posted_entries.append(entry)
-
-    if not initialized:
+    if initialized:
+        mark_many_posted(conn, source_id, new_entries)
+    else:
         mark_many_posted(conn, source_id, entries)
         mark_source_initialized(conn, source_id)
 
-    return posted_entries
+    return entries, new_entries
 
 
 async def send_summary(
@@ -1811,7 +1987,6 @@ async def check_all(
     if not dry_run and (not telegram_token):
         raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
 
-    summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
     now = datetime.now(timezone.utc)
     accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
@@ -1821,6 +1996,8 @@ async def check_all(
         "Accept": "text/html,text/markdown,text/plain,application/json,*/*",
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+        summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
+
         if not dry_run:
             chat_access = await validate_routing_chats(client, telegram_token, routing)
             accessible_chat_ids = {
@@ -1856,58 +2033,127 @@ async def check_all(
                         ", ".join(skipped_chat_ids),
                     )
 
-                posted_entries = await check_source(
-                    conn,
-                    client,
-                    source,
-                    telegram_token,
-                    target_chat_ids,
-                    dry_run=dry_run,
-                )
+                source_entries, new_entries = await check_source(conn, client, source)
+                if not source_entries:
+                    continue
+
                 for chat_id in target_chat_ids:
                     chat = routing.chats.get(chat_id)
-                    if not chat or not chat.send_summary:
+                    if not chat:
                         continue
-                    if chat.summary_schedule.mode == "immediate":
-                        summary_items_by_chat[chat_id].extend((source, entry) for entry in posted_entries)
-                    elif not dry_run:
-                        enqueue_summary_items(conn, chat_id, source["id"], posted_entries)
+
+                    should_send_instant = chat.delivery_mode in {"instant", "both"}
+                    should_queue = (
+                        chat.delivery_mode in {"digest", "both"}
+                        and chat.summary_schedule.mode != "none"
+                    )
+                    if not should_send_instant and not should_queue:
+                        continue
+
+                    candidate_ids = {entry.item_id for entry in new_entries}
+                    if should_send_instant:
+                        candidate_ids.update(load_failed_delivery_item_ids(conn, chat_id, source["id"]))
+
+                    if not candidate_ids:
+                        continue
+
+                    ordered_candidate_entries: list[ChangelogEntry] = []
+                    for entry in reversed(source_entries):
+                        if entry.item_id not in candidate_ids:
+                            continue
+                        ordered_candidate_entries.append(entry)
+
+                    if should_send_instant:
+                        for entry in ordered_candidate_entries:
+                            if is_delivered_to_chat(conn, source["id"], entry.item_id, chat_id):
+                                continue
+
+                            msg = format_message(source, entry)
+                            if dry_run:
+                                LOG.info(
+                                    "[%s] DRY RUN would post %s to %s:\n%s",
+                                    source["id"],
+                                    entry.item_id,
+                                    chat_id,
+                                    msg,
+                                )
+                                mark_delivery_status(conn, source["id"], entry.item_id, chat_id, sent=True)
+                                continue
+
+                            try:
+                                await send_telegram_message(client, telegram_token, chat_id, msg)
+                                mark_delivery_status(conn, source["id"], entry.item_id, chat_id, sent=True)
+                                LOG.info("[%s] posted %s to %s", source["id"], entry.item_id, chat_id)
+                            except Exception as exc:
+                                mark_delivery_status(
+                                    conn,
+                                    source["id"],
+                                    entry.item_id,
+                                    chat_id,
+                                    sent=False,
+                                    error=str(exc),
+                                )
+                                LOG.exception("[%s] failed to post %s to %s", source["id"], entry.item_id, chat_id)
+
+                    if should_queue:
+                        if dry_run:
+                            summary_items_by_chat[chat_id].extend((source, entry) for entry in ordered_candidate_entries)
+                        else:
+                            enqueue_summary_items(conn, chat_id, source["id"], ordered_candidate_entries)
             except Exception:
                 LOG.exception("[%s] failed", source.get("id", "unknown"))
 
         for chat in routing.chats.values():
-            if not chat.enabled or not chat.send_summary:
+            if not chat.enabled or chat.delivery_mode in {"none", "instant"}:
                 continue
+            if chat.summary_schedule.mode == "none":
+                continue
+
             if not dry_run and chat.chat_id not in accessible_chat_ids:
                 continue
 
             queued = load_summary_queue_items(conn, chat.chat_id)
             entries_for_chat: list[tuple[dict[str, Any], ChangelogEntry]] = []
+            seen_for_chat: set[tuple[str, str]] = set()
 
             for source_id, entry in queued:
                 source = source_lookup.get(source_id, {"id": source_id})
+                seen_for_chat.add((str(source_id), entry.item_id))
                 entries_for_chat.append((source, entry))
 
+            if dry_run:
+                for source, entry in summary_items_by_chat.get(chat.chat_id, []):
+                    source_id = str(source.get("id", ""))
+                    key = (source_id, entry.item_id)
+                    if key in seen_for_chat:
+                        continue
+                    seen_for_chat.add(key)
+                    entries_for_chat.append((source, entry))
+
             if chat.summary_schedule.mode == "immediate":
-                entries_for_chat.extend(summary_items_by_chat.get(chat.chat_id, []))
                 if not entries_for_chat:
                     continue
 
-                if dry_run:
-                    await send_summary(client, telegram_token, chat.chat_id, entries_for_chat, dry_run=True)
-                else:
-                    try:
-                        sent = await send_summary(
-                            client,
-                            telegram_token,
-                            chat.chat_id,
-                            entries_for_chat,
-                            dry_run=False,
-                        )
-                        if sent:
-                            clear_summary_queue(conn, chat.chat_id)
-                    except Exception:
-                        LOG.exception("failed to send immediate summary to %s", chat.chat_id)
+                try:
+                    sent = await send_summary(
+                        client,
+                        telegram_token,
+                        chat.chat_id,
+                        entries_for_chat,
+                        dry_run=dry_run,
+                    )
+                    if sent and not dry_run:
+                        clear_summary_queue(conn, chat.chat_id)
+                        for source_id, entry in queued:
+                            mark_delivery_status(
+                                conn,
+                                source_id,
+                                entry.item_id,
+                                chat.chat_id,
+                                sent=True,
+                            )
+                except Exception:
+                    LOG.exception("failed to send immediate summary to %s", chat.chat_id)
                 continue
 
             if not entries_for_chat:
@@ -1924,6 +2170,14 @@ async def check_all(
 
             if sent and not dry_run:
                 clear_summary_queue(conn, chat.chat_id)
+                for source_id, entry in queued:
+                    mark_delivery_status(
+                        conn,
+                        source_id,
+                        entry.item_id,
+                        chat.chat_id,
+                        sent=True,
+                    )
                 mark_chat_summary_sent(conn, chat.chat_id, now)
     conn.close()
 

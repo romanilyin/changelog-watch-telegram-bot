@@ -35,6 +35,11 @@ python bot.py --once
 python bot.py
 ```
 
+Основные переменные окружения:
+
+- `DISPLAY_TIMEZONE` — часовой пояс для отображения времени релизов GitHub (по умолчанию `Europe/Amsterdam`).
+- `GITHUB_TOKEN` — токен GitHub API для увеличения лимитов запросов.
+
 Перезагрузка маршрутизации в рантайме:
 
 - `ROUTING_RELOAD_TTL_SECONDS=0` — читать routing state из SQLite каждый цикл.
@@ -44,7 +49,17 @@ python bot.py
 Рассылка строится по routing state в SQLite (`DB_PATH`).
 `ROUTING_CONFIG_PATH` используется только как seed для первого импорта в БД.
 Для каждого чата можно указать конкретные источники (`sources`) и группы источников (`groups`).
-Сводка отправляется только туда, где `send_summary: true`.
+`delivery_mode` задаёт стратегию доставки новых релизов для чата:
+- `instant` — только немедленная публикация новых релизов.
+- `digest` — только сводка.
+- `both` — и сразу, и в сводку.
+- `none` — пропустить все новые релизы.
+
+Значение по умолчанию:
+- если `send_summary: false`, то `delivery_mode` = `instant`;
+- если `send_summary: true`, то `delivery_mode` = `both`.
+
+Сводка отправляется только в чаты с режимами `digest` или `both`.
 Ниже пример seed-конфига для `admin-routing.yaml`:
 
 ```yaml
@@ -65,6 +80,7 @@ chats:
       - core
     sources: []
     send_summary: true
+    delivery_mode: both
     summary_schedule:
       mode: immediate
   - chat_id: -1009876543210
@@ -75,6 +91,7 @@ chats:
       - codenomad_releases
     enabled: true
     send_summary: false
+    delivery_mode: digest
     summary_schedule:
       mode: weekly
       time: "20:00"
@@ -85,6 +102,7 @@ chats:
 - `immediate` (без отсрочки)
 - `daily` (по `time`, отправка каждый день после дедлайна)
 - `weekly` (по `time` + `weekday`)
+- `none` (сводка отключена для данного чата)
 
 ### Админ-команды
 

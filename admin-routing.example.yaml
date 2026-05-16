@@ -26,6 +26,7 @@ chats:
     sources: []
     enabled: true
     send_summary: true
+    delivery_mode: both
     summary_schedule:
       mode: immediate
 
@@ -37,6 +38,7 @@ chats:
       - codenomad_releases
     enabled: true
     send_summary: false
+    delivery_mode: digest
     summary_schedule:
       mode: weekly
       time: "20:00"

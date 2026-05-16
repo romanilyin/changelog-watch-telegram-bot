@@ -61,6 +61,8 @@ ROUTING_CONFIG_PATH=admin-routing.yaml
 ROUTING_RELOAD_TTL_SECONDS=0
 ADMIN_POLL_TIMEOUT=25
 ADMIN_COMMAND_POLL_SECONDS=2
+DISPLAY_TIMEZONE=Europe/Amsterdam
+GITHUB_TOKEN=ghp_xxx
 ```
 
 ### Как узнать `chat_id` для `admin-routing.yaml`
