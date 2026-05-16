@@ -9,6 +9,7 @@ source_groups:
   unity:
     - unity_ivanmurzak_releases
     - unity_coplay_releases
+    - locus_releases
 
 chats:
   - chat_id: 185073278

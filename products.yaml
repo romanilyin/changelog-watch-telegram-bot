@@ -44,3 +44,11 @@ sources:
     include_prereleases: false
     post_on_first_run: false
     max_body_chars: 2500
+
+  - id: locus_releases
+    product: Locus
+    type: github_releases
+    url: https://github.com/r1n7aro/Locus/releases
+    include_prereleases: false
+    post_on_first_run: false
+    max_body_chars: 2500
