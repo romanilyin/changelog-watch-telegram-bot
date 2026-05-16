@@ -10,12 +10,16 @@ source_groups:
     - openchamber_changelog
   releases:
     - codenomad_releases
+  unity:
+    - unity_ivanmurzak_releases
+    - unity_coplay_releases
 
 chats:
   - chat_id: -1001234567890
     title: Основной канал
     groups:
       - core
+      - unity
     sources: []
     enabled: true
     send_summary: true

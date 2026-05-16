@@ -5,12 +5,16 @@ source_groups:
   core:
     - opencode_changelog
     - openchamber_changelog
+  unity:
+    - unity_ivanmurzak_releases
+    - unity_coplay_releases
 
 chats:
-  - chat_id: -1001234567890
+  - chat_id: 185073278
     title: Основной канал
     groups:
       - core
+      - unity
     sources:
       - codenomad_releases
     send_summary: true

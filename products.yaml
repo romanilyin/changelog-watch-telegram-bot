@@ -28,3 +28,19 @@ sources:
     include_prereleases: false
     post_on_first_run: false
     max_body_chars: 2500
+
+  - id: unity_ivanmurzak_releases
+    product: Unity-MCP (IvanMurzak)
+    type: github_releases
+    url: https://github.com/IvanMurzak/Unity-MCP/releases
+    include_prereleases: false
+    post_on_first_run: false
+    max_body_chars: 2500
+
+  - id: unity_coplay_releases
+    product: Unity-MCP (Coplay)
+    type: github_releases
+    url: https://github.com/CoplayDev/unity-mcp/releases
+    include_prereleases: false
+    post_on_first_run: false
+    max_body_chars: 2500
