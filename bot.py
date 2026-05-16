@@ -2001,6 +2001,7 @@ async def check_all(
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
+        instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
 
         if not dry_run:
             chat_access = await validate_routing_chats(client, telegram_token, routing)
@@ -2068,35 +2069,11 @@ async def check_all(
                         ordered_candidate_entries.append(entry)
 
                     if should_send_instant:
-                        for entry in ordered_candidate_entries:
-                            if is_delivered_to_chat(conn, source["id"], entry.item_id, chat_id):
-                                continue
-
-                            msg = format_message(source, entry)
-                            if dry_run:
-                                LOG.info(
-                                    "[%s] DRY RUN would post %s to %s:\n%s",
-                                    source["id"],
-                                    entry.item_id,
-                                    chat_id,
-                                    msg,
-                                )
-                                continue
-
-                            try:
-                                await send_telegram_message(client, telegram_token, chat_id, msg)
-                                mark_delivery_status(conn, source["id"], entry.item_id, chat_id, sent=True)
-                                LOG.info("[%s] posted %s to %s", source["id"], entry.item_id, chat_id)
-                            except Exception as exc:
-                                mark_delivery_status(
-                                    conn,
-                                    source["id"],
-                                    entry.item_id,
-                                    chat_id,
-                                    sent=False,
-                                    error=str(exc),
-                                )
-                                LOG.exception("[%s] failed to post %s to %s", source["id"], entry.item_id, chat_id)
+                        instant_posts_by_chat[chat_id].extend(
+                            (source, entry)
+                            for entry in ordered_candidate_entries
+                            if not is_delivered_to_chat(conn, source["id"], entry.item_id, chat_id)
+                        )
 
                     if should_queue:
                         if dry_run:
@@ -2107,71 +2084,90 @@ async def check_all(
                 LOG.exception("[%s] failed", source.get("id", "unknown"))
 
         for chat in routing.chats.values():
-            if not chat.enabled or chat.delivery_mode in {"none", "instant"}:
-                continue
-            if chat.summary_schedule.mode == "none":
+            if not chat.enabled or chat.delivery_mode == "none":
                 continue
 
             if not dry_run and chat.chat_id not in accessible_chat_ids:
                 continue
 
-            queued = load_summary_queue_items(conn, chat.chat_id)
+            should_send_summary = (
+                chat.delivery_mode in {"digest", "both"}
+                and chat.summary_schedule.mode != "none"
+            )
+            queued = load_summary_queue_items(conn, chat.chat_id) if should_send_summary else []
             entries_for_chat: list[tuple[dict[str, Any], ChangelogEntry]] = []
             seen_for_chat: set[tuple[str, str]] = set()
 
-            for source_id, entry in queued:
-                source = source_lookup.get(source_id, {"id": source_id})
-                seen_for_chat.add((str(source_id), entry.item_id))
-                entries_for_chat.append((source, entry))
-
-            if dry_run:
-                for source, entry in summary_items_by_chat.get(chat.chat_id, []):
-                    source_id = str(source.get("id", ""))
-                    key = (source_id, entry.item_id)
-                    if key in seen_for_chat:
-                        continue
-                    seen_for_chat.add(key)
+            if should_send_summary:
+                for source_id, entry in queued:
+                    source = source_lookup.get(source_id, {"id": source_id})
+                    seen_for_chat.add((str(source_id), entry.item_id))
                     entries_for_chat.append((source, entry))
 
-            if chat.summary_schedule.mode == "immediate":
-                if not entries_for_chat:
+                if dry_run:
+                    for source, entry in summary_items_by_chat.get(chat.chat_id, []):
+                        source_id = str(source.get("id", ""))
+                        key = (source_id, entry.item_id)
+                        if key in seen_for_chat:
+                            continue
+                        seen_for_chat.add(key)
+                        entries_for_chat.append((source, entry))
+
+            summary_sent = False
+            if should_send_summary and entries_for_chat:
+                if chat.summary_schedule.mode == "immediate" or is_summary_due(
+                    chat.summary_schedule,
+                    now,
+                    chat.last_summary_sent_at,
+                ):
+                    try:
+                        summary_sent = await send_summary(
+                            client,
+                            telegram_token,
+                            chat.chat_id,
+                            entries_for_chat,
+                            dry_run=dry_run,
+                        )
+                    except Exception:
+                        LOG.exception("failed to send summary to %s", chat.chat_id)
+
+            finalize_summary_queue = summary_sent and not dry_run
+
+            if chat.delivery_mode not in {"instant", "both"}:
+                continue
+
+            for source, entry in instant_posts_by_chat.get(chat.chat_id, []):
+                if not dry_run:
+                    if is_delivered_to_chat(conn, source["id"], entry.item_id, chat.chat_id):
+                        continue
+
+                msg = format_message(source, entry)
+                if dry_run:
+                    LOG.info(
+                        "[%s] DRY RUN would post %s to %s:\n%s",
+                        source["id"],
+                        entry.item_id,
+                        chat.chat_id,
+                        msg,
+                    )
                     continue
 
                 try:
-                    sent = await send_summary(
-                        client,
-                        telegram_token,
+                    await send_telegram_message(client, telegram_token, chat.chat_id, msg)
+                    mark_delivery_status(conn, source["id"], entry.item_id, chat.chat_id, sent=True)
+                    LOG.info("[%s] posted %s to %s", source["id"], entry.item_id, chat.chat_id)
+                except Exception as exc:
+                    mark_delivery_status(
+                        conn,
+                        source["id"],
+                        entry.item_id,
                         chat.chat_id,
-                        entries_for_chat,
-                        dry_run=dry_run,
+                        sent=False,
+                        error=str(exc),
                     )
-                    if sent and not dry_run:
-                        clear_summary_queue(conn, chat.chat_id)
-                        for source_id, entry in queued:
-                            mark_delivery_status(
-                                conn,
-                                source_id,
-                                entry.item_id,
-                                chat.chat_id,
-                                sent=True,
-                            )
-                except Exception:
-                    LOG.exception("failed to send immediate summary to %s", chat.chat_id)
-                continue
+                    LOG.exception("[%s] failed to post %s to %s", source["id"], entry.item_id, chat.chat_id)
 
-            if not entries_for_chat:
-                continue
-
-            if not is_summary_due(chat.summary_schedule, now, chat.last_summary_sent_at):
-                continue
-
-            try:
-                sent = await send_summary(client, telegram_token, chat.chat_id, entries_for_chat, dry_run=dry_run)
-            except Exception:
-                LOG.exception("failed to send summary to %s", chat.chat_id)
-                continue
-
-            if sent and not dry_run:
+            if finalize_summary_queue:
                 clear_summary_queue(conn, chat.chat_id)
                 for source_id, entry in queued:
                     mark_delivery_status(
@@ -2181,7 +2177,8 @@ async def check_all(
                         chat.chat_id,
                         sent=True,
                     )
-                mark_chat_summary_sent(conn, chat.chat_id, now)
+                if chat.summary_schedule.mode != "immediate":
+                    mark_chat_summary_sent(conn, chat.chat_id, now)
     conn.close()
 
 
