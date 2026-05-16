@@ -10,6 +10,9 @@ source_groups:
     - unity_ivanmurzak_releases
     - unity_coplay_releases
     - locus_releases
+  ai:
+    - opencode_changelog
+    - openchamber_changelog
 
 chats:
   - chat_id: 185073278
@@ -23,3 +26,16 @@ chats:
     send_summary: true
     summary_schedule:
       mode: immediate
+
+  - chat_id: -5164745337
+    alias: stinger-ai-unity
+    title: AI + Unity digest
+    groups:
+      - unity
+      - ai
+    sources: []
+    send_summary: true
+    delivery_mode: digest
+    summary_schedule:
+      mode: daily
+      time: "20:30"

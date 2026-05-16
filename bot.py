@@ -2271,6 +2271,8 @@ async def check_all(
         raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
 
     now = datetime.now(timezone.utc)
+    _, schedule_tz = resolve_display_timezone()
+    schedule_now = now.astimezone(schedule_tz)
     accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
     conn = db_connect(db_path)
@@ -2396,7 +2398,7 @@ async def check_all(
             if should_send_summary and entries_for_chat:
                 if chat.summary_schedule.mode == "immediate" or is_summary_due(
                     chat.summary_schedule,
-                    now,
+                    schedule_now,
                     chat.last_summary_sent_at,
                 ):
                     try:

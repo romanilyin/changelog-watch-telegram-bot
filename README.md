@@ -69,6 +69,8 @@ python bot.py
 
 Сводка отправляется только в чаты с режимами `digest` или `both`.
 
+Время в `summary_schedule.time` интерпретируется в зоне, указанной в `DISPLAY_TIMEZONE` (по умолчанию `Europe/Amsterdam`).
+
 ### AI one-line summary (необязательно)
 
 - При `AI_SUMMARY_ENABLED=true` бот генерирует короткую строку `<b>Кратко:</b> ...` для instant-сообщений.
