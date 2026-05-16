@@ -3,9 +3,6 @@ admins:
     alias: stinger
 
 source_groups:
-  core:
-    - opencode_changelog
-    - openchamber_changelog
   unity:
     - unity_ivanmurzak_releases
     - unity_coplay_releases
@@ -13,13 +10,14 @@ source_groups:
   ai:
     - opencode_changelog
     - openchamber_changelog
+    - codenomad_releases
 
 chats:
   - chat_id: 185073278
     alias: stinger
     title: Основной канал
     groups:
-      - core
+      - ai
       - unity
     sources:
       - codenomad_releases
@@ -28,14 +26,14 @@ chats:
       mode: immediate
 
   - chat_id: -5164745337
-    alias: stinger-ai-unity
-    title: AI + Unity digest
+    alias: testchat
+    title: testchat stinger only
     groups:
-      - unity
       - ai
+      - unity
     sources: []
     send_summary: true
     delivery_mode: digest
     summary_schedule:
       mode: daily
-      time: "20:30"
+      time: "08:00"
