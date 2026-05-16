@@ -2047,6 +2047,8 @@ async def run_admin_command_listener(
                         continue
 
                     command, args = parsed
+                    if command not in {"reload", "subscribe", "unsubscribe", "start", "help"}:
+                        continue
 
                     source_ids = load_source_ids(config_path)
                     routing = routing_state.get(source_ids)
@@ -2137,13 +2139,6 @@ async def run_admin_command_listener(
                             "Доступные команды: /reload, /subscribe <source_id> [chat_id|alias], /unsubscribe <source_id> [chat_id|alias]",
                         )
                         continue
-
-                    await send_telegram_message(
-                        client,
-                        telegram_token,
-                        reply_chat_id,
-                        "Неизвестная команда. Используйте /help.",
-                    )
 
                 if updates:
                     await asyncio.sleep(0)
