@@ -39,6 +39,14 @@ python bot.py
 
 - `DISPLAY_TIMEZONE` — часовой пояс для отображения времени релизов GitHub (по умолчанию `Europe/Amsterdam`).
 - `GITHUB_TOKEN` — токен GitHub API для увеличения лимитов запросов.
+- `AI_SUMMARY_ENABLED` — включить AI one-line summary (`true/false`, по умолчанию `false`).
+- `AI_SUMMARY_API_BASE` — базовый URL OpenCode Zen API (по умолчанию `https://opencode.ai/zen/v1`).
+- `AI_SUMMARY_API_KEY` — API-ключ OpenCode Zen.
+- `AI_SUMMARY_MODEL` — модель для генерации short summary (`deepseek-v4-flash-free` по умолчанию).
+- `AI_SUMMARY_TARGET_LANGUAGE` — язык результата (`ru` по умолчанию).
+- `AI_SUMMARY_MAX_INPUT_CHARS` — лимит размера входных данных для AI (по умолчанию `6000`).
+- `AI_SUMMARY_TIMEOUT_SECONDS` — таймаут запроса в секундах (по умолчанию `30`).
+- `AI_SUMMARY_MAX_OUTPUT_CHARS` — лимит длины сгенерированной фразы (по умолчанию `220`).
 
 Перезагрузка маршрутизации в рантайме:
 
@@ -60,6 +68,14 @@ python bot.py
 - если `send_summary: true`, то `delivery_mode` = `both`.
 
 Сводка отправляется только в чаты с режимами `digest` или `both`.
+
+### AI one-line summary (необязательно)
+
+- При `AI_SUMMARY_ENABLED=true` бот генерирует короткую строку `<b>Кратко:</b> ...` для instant-сообщений.
+- Результат кэшируется в SQLite таблице `ai_summaries` по комбинации `source_id + item_id + model + target_language`.
+- Если OpenCode Zen не отвечает или ключ не задан, бот отправляет обычное сообщение без ошибок и продолжает работу.
+- В `--dry-run` кэш не записывается (чтение из `ai_summaries` разрешено, запись запрещена).
+
 Ниже пример seed-конфига для `admin-routing.yaml`:
 
 ```yaml

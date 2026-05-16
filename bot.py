@@ -1038,6 +1038,22 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
         )
         """
     )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_summaries (
+            source_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            target_language TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, item_id, model, target_language)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_summaries_source_item ON ai_summaries(source_id, item_id)")
+
     ensure_routing_columns(conn)
     conn.commit()
     return conn
@@ -1093,6 +1109,241 @@ def mark_many_posted(conn: sqlite3.Connection, source_id: str, entries: list[Cha
         [(source_id, entry.item_id, now) for entry in entries],
     )
     conn.commit()
+
+
+def ai_summary_enabled() -> bool:
+    return os.getenv("AI_SUMMARY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_ai_summary_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int((value or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def get_ai_summary_settings() -> tuple[str, str, str, int, int, int]:
+    api_base = os.getenv("AI_SUMMARY_API_BASE", "https://opencode.ai/zen/v1").strip().rstrip("/")
+    if not api_base:
+        api_base = "https://opencode.ai/zen/v1"
+
+    model = os.getenv("AI_SUMMARY_MODEL", "deepseek-v4-flash-free").strip() or "deepseek-v4-flash-free"
+    target_language = os.getenv("AI_SUMMARY_TARGET_LANGUAGE", "ru").strip() or "ru"
+    max_input_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_INPUT_CHARS"), 6000)
+    timeout_seconds = _parse_ai_summary_int(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS"), 30)
+    max_output_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_OUTPUT_CHARS"), 220)
+
+    return api_base, model, target_language, max_input_chars, timeout_seconds, max_output_chars
+
+
+def clean_one_line_summary(text: str, max_len: int = 220) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip('"\'«»`')
+
+    prefixes = (
+        "кратко:",
+        "summary:",
+        "итог:",
+    )
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    banned_starts = (
+        "в этом релизе ",
+        "это обновление ",
+        "обновление содержит ",
+        "релиз добавляет ",
+    )
+    lowered = text.lower()
+    for start in banned_starts:
+        if lowered.startswith(start):
+            text = text[len(start):].strip()
+            text = text[:1].upper() + text[1:] if text else text
+            break
+
+    if max_len <= 0:
+        return ""
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+
+    return text
+
+
+def build_summary_input(source: dict[str, Any], entry: ChangelogEntry, max_chars: int) -> str:
+    product = str(source.get("product") or source["id"])
+    body = compact_markdown_for_telegram(entry.body or "")
+    text = "\n".join(
+        [
+            f"Product: {product}",
+            f"Version: {entry.version}",
+            f"Title: {entry.title}",
+            "",
+            "Release notes:",
+            body or "No release notes.",
+        ]
+    )
+    return truncate(text, max_chars)
+
+
+def load_ai_summary(
+    conn: sqlite3.Connection,
+    source_id: str,
+    item_id: str,
+    model: str,
+    target_language: str,
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT summary
+        FROM ai_summaries
+        WHERE source_id = ? AND item_id = ? AND model = ? AND target_language = ?
+        """,
+        (source_id, item_id, model, target_language),
+    ).fetchone()
+
+    return str(row[0]) if row else None
+
+
+def save_ai_summary(
+    conn: sqlite3.Connection,
+    source_id: str,
+    item_id: str,
+    model: str,
+    target_language: str,
+    summary: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO ai_summaries(
+            source_id,
+            item_id,
+            model,
+            target_language,
+            summary,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_id,
+            item_id,
+            model,
+            target_language,
+            summary,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+async def generate_ai_summary(
+    client: httpx.AsyncClient,
+    source: dict[str, Any],
+    entry: ChangelogEntry,
+) -> str | None:
+    if not ai_summary_enabled():
+        return None
+
+    api_key = os.getenv("AI_SUMMARY_API_KEY", "").strip()
+    if not api_key:
+        LOG.warning("AI_SUMMARY_ENABLED=true but AI_SUMMARY_API_KEY is empty")
+        return None
+
+    api_base, model, target_language, max_input_chars, timeout_seconds, max_output_chars = get_ai_summary_settings()
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": max(max_output_chars + 20, 60),
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize software release notes for Telegram. "
+                    f"Return exactly one short sentence in {target_language}. "
+                    "No markdown. No bullets. No quotes. "
+                    "Do not mention that this is a release. "
+                    "Focus on practical changes."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Make a concise one-line summary of changes in {target_language}. "
+                    f"Not longer than {max_output_chars} symbols. "
+                    "Avoid phrases such as 'this release' and 'the update includes'.\n\n"
+                    f"{build_summary_input(source, entry, max_input_chars)}"
+                ),
+            },
+        ],
+    }
+
+    try:
+        response = await client.post(
+            f"{api_base}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            LOG.warning("AI summary response for %s has no choices", source["id"])
+            return None
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            LOG.warning("AI summary response for %s has invalid choice payload", source["id"])
+            return None
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            LOG.warning("AI summary response for %s has invalid message payload", source["id"])
+            return None
+
+        content = message.get("content")
+        if content is None:
+            LOG.warning("AI summary response for %s has empty content", source["id"])
+            return None
+
+        summary = clean_one_line_summary(str(content), max_len=max_output_chars)
+        if not summary:
+            return None
+        return summary
+    except Exception:
+        LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
+        return None
+
+
+async def get_or_generate_ai_summary(
+    conn: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    source: dict[str, Any],
+    entry: ChangelogEntry,
+    *,
+    dry_run: bool = False,
+) -> str | None:
+    if not ai_summary_enabled():
+        return None
+
+    _, model, target_language, _, _, _ = get_ai_summary_settings()
+    cached = load_ai_summary(conn, source["id"], entry.item_id, model, target_language)
+    if cached:
+        return cached
+
+    summary = await generate_ai_summary(client, source, entry)
+    if summary and not dry_run:
+        save_ai_summary(conn, source["id"], entry.item_id, model, target_language, summary)
+
+    return summary
 
 
 def load_failed_delivery_item_ids(conn: sqlite3.Connection, chat_id: str, source_id: str) -> list[str]:
@@ -1566,6 +1817,23 @@ def format_message(source: dict[str, Any], entry: ChangelogEntry) -> str:
         parts.append(f"<b>Дата:</b> {html.escape(date)}")
     parts.extend(["", body, "", f'<a href="{url}">Открыть источник</a>'])
     return "\n".join(parts)
+
+
+def format_message_with_ai_summary(
+    source: dict[str, Any],
+    entry: ChangelogEntry,
+    ai_summary: str | None,
+) -> str:
+    message = format_message(source, entry)
+    if not ai_summary:
+        return message
+
+    lines = message.splitlines()
+    if not lines:
+        return message
+
+    lines.insert(1, f"<b>Кратко:</b> {html.escape(ai_summary)}")
+    return "\n".join(lines)
 
 
 def format_summary_entry(source: dict[str, Any], entry: ChangelogEntry) -> str:
@@ -2141,7 +2409,14 @@ async def check_all(
                     if is_delivered_to_chat(conn, source["id"], entry.item_id, chat.chat_id):
                         continue
 
-                msg = format_message(source, entry)
+                ai_summary = await get_or_generate_ai_summary(
+                    conn,
+                    client,
+                    source,
+                    entry,
+                    dry_run=dry_run,
+                )
+                msg = format_message_with_ai_summary(source, entry, ai_summary)
                 if dry_run:
                     LOG.info(
                         "[%s] DRY RUN would post %s to %s:\n%s",
