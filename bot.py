@@ -2053,14 +2053,6 @@ async def run_admin_command_listener(
                     source_ids = load_source_ids(config_path)
                     routing = routing_state.get(source_ids)
                     if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
-                        chat_id_raw = message.get("chat", {}).get("id")
-                        if chat_id_raw is not None:
-                            await send_telegram_message(
-                                client,
-                                telegram_token,
-                                str(int(str(chat_id_raw).strip())),
-                                "🚫 Нет доступа. Команда доступна только админам.",
-                            )
                         continue
 
                     reply_chat_id_raw = message.get("chat", {}).get("id")
