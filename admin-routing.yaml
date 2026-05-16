@@ -1,5 +1,6 @@
 admins:
-  - 12345678
+  - id: 185073278
+    alias: stinger
 
 source_groups:
   core:
@@ -10,8 +11,8 @@ source_groups:
     - unity_coplay_releases
 
 chats:
-  - chat_id: -1001234567890
-    alias: main
+  - chat_id: 185073278
+    alias: stinger
     title: Основной канал
     groups:
       - core
