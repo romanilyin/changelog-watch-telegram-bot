@@ -1,0 +1,30 @@
+# Global polling interval.
+poll_minutes: 30
+
+# On first run, sources with post_on_first_run: false are only memorized in SQLite.
+# This prevents the bot from spamming the chat with old releases/changelog entries.
+sources:
+  - id: opencode_changelog
+    product: OpenCode
+    type: github_releases
+    url: https://github.com/anomalyco/opencode/releases
+    include_prereleases: true
+    post_on_first_run: false
+    max_body_chars: 2500
+
+  - id: openchamber_changelog
+    product: OpenChamber
+    type: markdown_changelog
+    url: https://raw.githubusercontent.com/openchamber/openchamber/main/CHANGELOG.md
+    source_url: https://github.com/openchamber/openchamber/blob/main/CHANGELOG.md
+    skip_unreleased: true
+    post_on_first_run: false
+    max_body_chars: 2500
+
+  - id: codenomad_releases
+    product: CodeNomad
+    type: github_releases
+    url: https://github.com/NeuralNomadsAI/CodeNomad/releases
+    include_prereleases: false
+    post_on_first_run: false
+    max_body_chars: 2500
