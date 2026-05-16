@@ -16,16 +16,18 @@ import html
 import logging
 import os
 import re
+import signal
+from collections import defaultdict
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -49,6 +51,227 @@ class ChangelogEntry:
     is_prerelease: bool = False
 
 
+@dataclass(frozen=True)
+class ChatRouting:
+    chat_id: str
+    groups: set[str]
+    source_ids: set[str]
+    title: str | None = None
+    enabled: bool = True
+    send_summary: bool = True
+
+
+@dataclass(frozen=True)
+class RoutingConfig:
+    admins: set[str]
+    source_groups: dict[str, set[str]]
+    chats: dict[str, ChatRouting]
+
+
+@dataclass(frozen=True)
+class ChatAccessResult:
+    chat_id: str
+    accessible: bool
+    reason: str | None = None
+
+
+@dataclass
+class RoutingState:
+    db_path: str
+    ttl_seconds: int = 0
+    source_config_path: str | None = None
+    config: RoutingConfig | None = None
+    loaded_at_monotonic: float | None = None
+
+    def get(self, source_ids: set[str], *, force_reload: bool = False) -> RoutingConfig:
+        if self.config is None:
+            return self._reload(source_ids, reason="initial")
+
+        if force_reload:
+            return self._reload(source_ids, reason="forced")
+
+        if self.ttl_seconds <= 0:
+            return self._reload(source_ids, reason="poll-cycle")
+
+        if self.ttl_seconds > 0:
+            if self.loaded_at_monotonic is None:
+                return self._reload(source_ids, reason="state-reset")
+            if monotonic() - self.loaded_at_monotonic >= self.ttl_seconds:
+                return self._reload(source_ids, reason="ttl-expired")
+
+        return self.config
+
+    def _reload(self, source_ids: set[str], *, reason: str) -> RoutingConfig:
+        with db_connect(self.db_path) as conn:
+            ensure_routing_state_seeded(conn, self.source_config_path, source_ids)
+            config = load_routing_config_from_db(conn, source_ids)
+        self.config = config
+        self.loaded_at_monotonic = monotonic()
+        LOG.info("routing state loaded from sqlite (%s)", reason)
+        return config
+
+
+def parse_command(text: str | None) -> tuple[str, list[str]] | None:
+    if not text:
+        return None
+
+    line = text.strip().splitlines()[0] if text else ""
+    if not line.startswith("/"):
+        return None
+
+    parts = line.split()
+    if not parts:
+        return None
+
+    command_token = parts[0]
+    if not command_token.startswith("/"):
+        return None
+
+    command = command_token[1:].split("@", 1)[0].strip().lower()
+    if not command:
+        return None
+
+    return command, parts[1:]
+
+
+def is_authorized_admin(admins: set[str], raw_user_id: Any) -> bool:
+    if not admins:
+        return False
+
+    if raw_user_id is None:
+        return False
+
+    try:
+        user_id = str(int(str(raw_user_id).strip()))
+    except (TypeError, ValueError):
+        return False
+
+    return user_id in admins
+
+
+def load_source_ids(config_path: str | Path) -> set[str]:
+    config = load_config(config_path)
+    return collect_source_ids(config["sources"])
+
+
+def load_routing_yaml(path: str | Path) -> dict[str, Any]:
+    return load_yaml_file(path)
+
+
+def routing_has_data(conn: sqlite3.Connection) -> bool:
+    tables = (
+        conn.execute("SELECT COUNT(*) FROM routing_admins").fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM routing_source_groups").fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM routing_chats").fetchone()[0],
+    )
+    return any(value > 0 for value in tables)
+
+
+def ensure_routing_state_seeded(
+    conn: sqlite3.Connection,
+    source_config_path: str | None,
+    source_ids: set[str],
+) -> None:
+    if routing_has_data(conn):
+        return
+
+    if source_config_path is None:
+        raise RuntimeError("routing state is empty and ROUTING_CONFIG_PATH is not set")
+
+    source_path = Path(source_config_path)
+    if not source_path.exists():
+        raise RuntimeError(f"routing seed file not found: {source_config_path}")
+
+    route_config = load_routing_config(source_path, source_ids)
+    import_routing_config_to_db(conn, route_config)
+
+
+def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig) -> None:
+    for admin_id in routing.admins:
+        conn.execute(
+            "INSERT OR IGNORE INTO routing_admins(user_id) VALUES (?)",
+            (admin_id,),
+        )
+
+    for group_name, source_ids in routing.source_groups.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO routing_source_groups(group_name) VALUES (?)",
+            (group_name,),
+        )
+        for source_id in sorted(source_ids):
+            conn.execute(
+                "INSERT OR REPLACE INTO routing_source_group_sources(group_name, source_id) VALUES (?, ?)",
+                (group_name, source_id),
+            )
+
+    for chat in routing.chats.values():
+        conn.execute(
+            "INSERT OR REPLACE INTO routing_chats(chat_id, title, enabled, send_summary) VALUES (?, ?, ?, ?)",
+            (chat.chat_id, chat.title, int(chat.enabled), int(chat.send_summary)),
+        )
+
+        for group_name in sorted(chat.groups):
+            conn.execute(
+                "INSERT OR IGNORE INTO routing_chat_groups(chat_id, group_name) VALUES (?, ?)",
+                (chat.chat_id, group_name),
+            )
+
+        for source_id in sorted(chat.source_ids):
+            conn.execute(
+                "INSERT OR REPLACE INTO routing_chat_sources(chat_id, source_id) VALUES (?, ?)",
+                (chat.chat_id, source_id),
+            )
+
+    conn.commit()
+
+
+def apply_chat_subscription_change_db(
+    conn: sqlite3.Connection,
+    source_id: str,
+    chat_id: str,
+    *,
+    add: bool,
+    chat_title: str | None = None,
+) -> str:
+    if add:
+        conn.execute(
+            "INSERT OR IGNORE INTO routing_chats(chat_id, title, enabled, send_summary) VALUES (?, ?, 1, 1)",
+            (chat_id, chat_title or None),
+        )
+        if chat_title:
+            conn.execute(
+                "UPDATE routing_chats SET title = ? WHERE chat_id = ? AND (title IS NULL OR title = '')",
+                (chat_title, chat_id),
+            )
+
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO routing_chat_sources(chat_id, source_id) VALUES (?, ?)",
+            (chat_id, source_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return f"чат {chat_id} уже подписан на {source_id}"
+        return f"чат {chat_id} подписан на {source_id}"
+
+    if not conn.execute("SELECT 1 FROM routing_chats WHERE chat_id = ?", (chat_id,)).fetchone():
+        return f"чат {chat_id} не найден в routing store"
+
+    cursor = conn.execute(
+        "DELETE FROM routing_chat_sources WHERE chat_id = ? AND source_id = ?",
+        (chat_id, source_id),
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        return f"чат {chat_id} не подписан на {source_id}"
+
+    return f"чат {chat_id} отписан от {source_id}"
+
+
+def apply_chat_subscription_change(db_path: str | Path, source_id: str, chat_id: str, *, add: bool, chat_title: str | None = None) -> str:
+    with db_connect(db_path) as conn:
+        return apply_chat_subscription_change_db(conn, source_id, chat_id, add=add, chat_title=chat_title)
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -56,18 +279,242 @@ def setup_logging() -> None:
     )
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def load_yaml_file(path: str | Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain YAML object")
+    return data
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    data = load_yaml_file(path)
     if "sources" not in data or not isinstance(data["sources"], list):
         raise ValueError("products.yaml must contain a top-level 'sources' list")
     return data
+
+
+def normalize_chat_id(value: Any, field: str) -> str:
+    if value is None:
+        raise ValueError(f"{field} must be defined")
+
+    try:
+        return str(int(str(value).strip()))
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a valid integer telegram id: {value!r}")
+
+
+def normalize_source_id(value: Any) -> str:
+    if value is None:
+        raise ValueError("source_id must be defined")
+    source_id = str(value).strip()
+    if not source_id:
+        raise ValueError("source_id must be non-empty")
+    return source_id
+
+
+def normalize_string(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig:
+    data = load_yaml_file(path)
+
+    admins_raw = data.get("admins", [])
+    if not isinstance(admins_raw, list):
+        raise ValueError("routing config 'admins' must be a list")
+    admins = {normalize_chat_id(admin, "admins") for admin in admins_raw}
+
+    source_groups_raw = data.get("source_groups", {})
+    if not isinstance(source_groups_raw, dict):
+        raise ValueError("routing config 'source_groups' must be an object")
+    source_groups: dict[str, set[str]] = {}
+    for group_name, raw_source_ids in source_groups_raw.items():
+        if not isinstance(raw_source_ids, list):
+            raise ValueError(f"source group '{group_name}' must be a list")
+        group_sources: set[str] = set()
+        for raw_source_id in raw_source_ids:
+            source_id = normalize_source_id(raw_source_id)
+            if source_id not in source_ids:
+                raise ValueError(f"source group '{group_name}' references unknown source: {source_id}")
+            group_sources.add(source_id)
+        source_groups[str(group_name)] = group_sources
+
+    chats_raw = data.get("chats", [])
+    if not isinstance(chats_raw, list):
+        raise ValueError("routing config 'chats' must be a list")
+
+    chats: dict[str, ChatRouting] = {}
+    for idx, raw_chat in enumerate(chats_raw, start=1):
+        if not isinstance(raw_chat, dict):
+            raise ValueError(f"chat entry #{idx} in routing config must be an object")
+
+        chat_id_value = raw_chat.get("chat_id", raw_chat.get("id"))
+        chat_id = normalize_chat_id(chat_id_value, f"chats[{idx}].chat_id")
+
+        raw_groups = raw_chat.get("groups", [])
+        if not isinstance(raw_groups, list):
+            raise ValueError(f"chats[{idx}] groups must be a list")
+        chat_groups: set[str] = set()
+        for raw_group_name in raw_groups:
+            group_name = normalize_string(raw_group_name)
+            if not group_name:
+                continue
+            if group_name not in source_groups:
+                raise ValueError(f"chat {chat_id} uses unknown source group '{group_name}'")
+            chat_groups.add(group_name)
+
+        raw_source_ids = raw_chat.get("sources", [])
+        if not isinstance(raw_source_ids, list):
+            raise ValueError(f"chats[{idx}] sources must be a list")
+        chat_source_ids: set[str] = set()
+        for raw_source_id in raw_source_ids:
+            source_id = normalize_source_id(raw_source_id)
+            if source_id not in source_ids:
+                raise ValueError(f"chat {chat_id} uses unknown source '{source_id}'")
+            chat_source_ids.add(source_id)
+
+        title = normalize_string(raw_chat.get("title")) or None
+        enabled = bool(raw_chat.get("enabled", True))
+        send_summary = bool(raw_chat.get("send_summary", True))
+
+        if chat_id in chats:
+            raise ValueError(f"duplicate chat entry for chat_id {chat_id}")
+
+        chats[chat_id] = ChatRouting(
+            chat_id=chat_id,
+            groups=chat_groups,
+            source_ids=chat_source_ids,
+            title=title,
+            enabled=enabled,
+            send_summary=send_summary,
+        )
+
+    return RoutingConfig(admins=admins, source_groups=source_groups, chats=chats)
+
+
+def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) -> RoutingConfig:
+    admins_raw = [
+        normalize_chat_id(row[0], "admins")
+        for row in conn.execute("SELECT user_id FROM routing_admins ORDER BY user_id").fetchall()
+    ]
+    admins = set(admins_raw)
+
+    source_groups: dict[str, set[str]] = {}
+    for raw_group_name in conn.execute("SELECT group_name FROM routing_source_groups ORDER BY group_name").fetchall():
+        source_groups[str(raw_group_name[0])] = set()
+
+    for group_name, raw_source_id in conn.execute(
+        "SELECT group_name, source_id FROM routing_source_group_sources ORDER BY group_name, source_id"
+    ).fetchall():
+        source_id = normalize_source_id(raw_source_id)
+        if source_id not in source_ids:
+            raise ValueError(f"source group '{group_name}' references unknown source '{source_id}'")
+        source_groups[str(group_name)].add(source_id)
+
+    chats: dict[str, ChatRouting] = {}
+    for idx, raw_chat in enumerate(
+        conn.execute("SELECT chat_id, title, enabled, send_summary FROM routing_chats ORDER BY chat_id"),
+        start=1,
+    ):
+        chat_id = normalize_chat_id(raw_chat[0], f"chats[{idx}].chat_id")
+        raw_chat_groups = [
+            normalize_string(row[0])
+            for row in conn.execute(
+                "SELECT group_name FROM routing_chat_groups WHERE chat_id = ? ORDER BY group_name",
+                (chat_id,),
+            ).fetchall()
+        ]
+
+        chat_groups: set[str] = set()
+        for raw_group_name in raw_chat_groups:
+            if not raw_group_name:
+                continue
+            if raw_group_name not in source_groups:
+                raise ValueError(f"chat {chat_id} uses unknown source group '{raw_group_name}'")
+            chat_groups.add(raw_group_name)
+
+        raw_chat_sources = [
+            normalize_source_id(row[0])
+            for row in conn.execute(
+                "SELECT source_id FROM routing_chat_sources WHERE chat_id = ? ORDER BY source_id",
+                (chat_id,),
+            ).fetchall()
+        ]
+
+        chat_source_ids: set[str] = set()
+        for source_id in raw_chat_sources:
+            if source_id not in source_ids:
+                raise ValueError(f"chat {chat_id} uses unknown source '{source_id}'")
+            chat_source_ids.add(source_id)
+
+        title = normalize_string(raw_chat[1]) or None
+        enabled = bool(raw_chat[2])
+        send_summary = bool(raw_chat[3])
+
+        if chat_id in chats:
+            raise ValueError(f"duplicate chat entry for chat_id {chat_id}")
+
+        chats[chat_id] = ChatRouting(
+            chat_id=chat_id,
+            groups=chat_groups,
+            source_ids=chat_source_ids,
+            title=title,
+            enabled=enabled,
+            send_summary=send_summary,
+        )
+
+    return RoutingConfig(admins=admins, source_groups=source_groups, chats=chats)
+
+
+def build_source_to_chat_map(sources: list[dict[str, Any]], routing: RoutingConfig) -> dict[str, list[str]]:
+    source_to_chat: dict[str, list[str]] = defaultdict(list)
+
+    for source in sources:
+        source_id = source["id"]
+        source_to_chat[source_id] = []
+
+    for chat in routing.chats.values():
+        if not chat.enabled:
+            continue
+
+        target_sources = set(chat.source_ids)
+        for group_name in chat.groups:
+            target_sources.update(routing.source_groups.get(group_name, set()))
+
+        if not target_sources:
+            LOG.warning("chat %s has no subscriptions; skipping", chat.chat_id)
+            continue
+
+        for source_id in target_sources:
+            if source_id not in source_to_chat:
+                continue
+            if chat.chat_id not in source_to_chat[source_id]:
+                source_to_chat[source_id].append(chat.chat_id)
+
+    return source_to_chat
+
+
+def collect_source_ids(sources: list[dict[str, Any]]) -> set[str]:
+    source_ids: set[str] = set()
+    for index, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            raise ValueError(f"source #{index} must be an object")
+        source_id = normalize_source_id(source.get("id"))
+        if source_id in source_ids:
+            raise ValueError(f"duplicate source id '{source_id}' in sources at position {index}")
+        source_ids.add(source_id)
+        source["id"] = source_id
+    return source_ids
 
 
 def db_connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS posted_items (
@@ -75,6 +522,61 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
             item_id TEXT NOT NULL,
             posted_at TEXT NOT NULL,
             PRIMARY KEY (source_id, item_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_admins (
+            user_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_source_groups (
+            group_name TEXT PRIMARY KEY
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_source_group_sources (
+            group_name TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            PRIMARY KEY (group_name, source_id),
+            FOREIGN KEY (group_name) REFERENCES routing_source_groups(group_name) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_chats (
+            chat_id TEXT PRIMARY KEY,
+            title TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            send_summary INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_chat_groups (
+            chat_id TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            PRIMARY KEY (chat_id, group_name),
+            FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (group_name) REFERENCES routing_source_groups(group_name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_chat_sources (
+            chat_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            PRIMARY KEY (chat_id, source_id),
+            FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE
         )
         """
     )
@@ -388,12 +890,6 @@ def format_summary_entry(source: dict[str, Any], entry: ChangelogEntry) -> str:
     )
 
 
-def parse_chat_ids(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [chat_id.strip() for chat_id in value.split(",") if chat_id.strip()]
-
-
 def build_aggregate_summary(entries: list[tuple[dict[str, Any], ChangelogEntry]]) -> str:
     lines: list[str] = ["📌 <b>Сводка новых релизов</b>"]
     for source, entry in entries:
@@ -416,12 +912,265 @@ async def send_telegram_message(client: httpx.AsyncClient, token: str, chat_id: 
     response.raise_for_status()
 
 
+async def telegram_api_get_result(
+    client: httpx.AsyncClient,
+    token: str,
+    method: str,
+    *,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    response = await client.get(
+        f"https://api.telegram.org/bot{token}/{method}",
+        params=params or {},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        description = payload.get("description") if isinstance(payload, dict) else None
+        raise RuntimeError(f"Telegram API method '{method}' failed: {description}")
+    return payload.get("result")
+
+
+async def get_bot_user_id(client: httpx.AsyncClient, token: str) -> str:
+    result = await telegram_api_get_result(client, token, "getMe")
+    if not isinstance(result, dict):
+        raise RuntimeError("Telegram API getMe returned invalid payload")
+
+    raw_id = result.get("id")
+    if raw_id is None:
+        raise RuntimeError("Telegram API getMe response does not include bot id")
+
+    return str(int(raw_id))
+
+
+def can_send_in_chat(member: dict[str, Any]) -> tuple[bool, str | None]:
+    status = str(member.get("status") or "")
+
+    if status in {"kicked", "left"}:
+        return False, f"bot status in chat is '{status}'"
+
+    if status not in {"creator", "administrator", "member", "restricted"}:
+        return False, f"unsupported chat member status '{status}'"
+
+    if status == "restricted":
+        has_send_flags = any(
+            isinstance(member.get(flag), bool) for flag in ("can_send_messages", "can_post_messages")
+        )
+        if not has_send_flags:
+            return False, "restricted bot member has no send permission flags"
+
+    for key in ("can_send_messages", "can_post_messages"):
+        value = member.get(key)
+        if isinstance(value, bool) and not value:
+            return False, f"bot cannot send: {key}=false"
+
+    return True, None
+
+
+async def validate_chat_access(
+    client: httpx.AsyncClient,
+    token: str,
+    bot_user_id: str,
+    chat_id: str,
+) -> ChatAccessResult:
+    await telegram_api_get_result(client, token, "getChat", params={"chat_id": chat_id})
+
+    member = await telegram_api_get_result(
+        client,
+        token,
+        "getChatMember",
+        params={"chat_id": chat_id, "user_id": bot_user_id},
+    )
+
+    if not isinstance(member, dict):
+        return ChatAccessResult(chat_id=chat_id, accessible=False, reason="getChatMember returned invalid payload")
+
+    can_send, reason = can_send_in_chat(member)
+    return ChatAccessResult(chat_id=chat_id, accessible=can_send, reason=reason)
+
+
+async def validate_routing_chats(
+    client: httpx.AsyncClient,
+    token: str,
+    routing: RoutingConfig,
+) -> dict[str, bool]:
+    bot_user_id = await get_bot_user_id(client, token)
+    access: dict[str, bool] = {}
+
+    for chat_id, chat in routing.chats.items():
+        if not chat.enabled:
+            continue
+
+        try:
+            result = await validate_chat_access(client, token, bot_user_id, chat_id)
+            access[result.chat_id] = result.accessible
+            if result.accessible:
+                LOG.info("chat %s is accessible for bot", chat_id)
+            else:
+                LOG.warning("chat %s is not accessible for bot: %s", chat_id, result.reason)
+        except Exception as exc:
+            access[chat_id] = False
+            LOG.warning("chat %s validation failed: %s", chat_id, exc)
+
+    return access
+
+
+async def run_admin_command_listener(
+    telegram_token: str,
+    db_path: str,
+    config_path: str,
+    routing_state: RoutingState,
+    reload_requested: asyncio.Event,
+) -> None:
+    update_offset = 0
+    poll_timeout = max(5, int(os.getenv("ADMIN_POLL_TIMEOUT", "25") or "25"))
+    command_poll_timeout = max(0, int(os.getenv("ADMIN_COMMAND_POLL_SECONDS", "2") or "2"))
+    headers = {
+        "User-Agent": "changelog-watch-telegram-bot/1.0",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60, headers=headers, follow_redirects=True) as client:
+        while True:
+            try:
+                params = {
+                    "offset": update_offset,
+                    "timeout": poll_timeout,
+                    "allowed_updates": ["message", "channel_post", "edited_message"],
+                }
+                updates = await telegram_api_get_result(client, telegram_token, "getUpdates", params=params)
+                if not isinstance(updates, list):
+                    updates = []
+
+                for update in updates:
+                    if not isinstance(update, dict):
+                        continue
+
+                    update_offset_raw = update.get("update_id")
+                    if isinstance(update_offset_raw, int):
+                        update_offset = update_offset_raw + 1
+
+                    message = update.get("message") or update.get("channel_post") or update.get("edited_message")
+                    if not isinstance(message, dict):
+                        continue
+
+                    parsed = parse_command(message.get("text"))
+                    if parsed is None:
+                        continue
+
+                    command, args = parsed
+
+                    source_ids = load_source_ids(config_path)
+                    routing = routing_state.get(source_ids)
+                    if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
+                        chat_id_raw = message.get("chat", {}).get("id")
+                        if chat_id_raw is not None:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                str(int(str(chat_id_raw).strip())),
+                                "🚫 Нет доступа. Команда доступна только админам.",
+                            )
+                        continue
+
+                    reply_chat_id_raw = message.get("chat", {}).get("id")
+                    if reply_chat_id_raw is None:
+                        continue
+
+                    reply_chat_id = str(int(str(reply_chat_id_raw).strip()))
+
+                    if command == "reload":
+                        routing_state.get(source_ids, force_reload=True)
+                        reload_requested.set()
+                        await send_telegram_message(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            "🔄 Routing config перезагружен.",
+                        )
+                        continue
+
+                    if command in {"subscribe", "unsubscribe"}:
+                        if not args:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                "Использование: /subscribe <source_id> [chat_id] или /unsubscribe <source_id> [chat_id]",
+                            )
+                            continue
+
+                        source_id = normalize_source_id(args[0])
+                        if source_id not in source_ids:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Источник {source_id!r} отсутствует в products.yaml",
+                            )
+                            continue
+
+                        target_chat_id = normalize_chat_id(
+                            args[1] if len(args) > 1 else reply_chat_id,
+                            "chat_id",
+                        )
+
+                        if command == "subscribe":
+                            result = apply_chat_subscription_change(
+                                db_path,
+                                source_id,
+                                target_chat_id,
+                                add=True,
+                                chat_title=str(message.get("chat", {}).get("title", "")).strip() or None,
+                            )
+                        else:
+                            result = apply_chat_subscription_change(
+                                db_path,
+                                source_id,
+                                target_chat_id,
+                                add=False,
+                            )
+
+                        reload_requested.set()
+                        await send_telegram_message(client, telegram_token, reply_chat_id, result)
+                        continue
+
+                    if command in {"start", "help"}:
+                        await send_telegram_message(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            "Доступные команды: /reload, /subscribe <source_id> [chat_id], /unsubscribe <source_id> [chat_id]",
+                        )
+                        continue
+
+                    await send_telegram_message(
+                        client,
+                        telegram_token,
+                        reply_chat_id,
+                        "Неизвестная команда. Используйте /help.",
+                    )
+
+                if updates:
+                    await asyncio.sleep(0)
+                    continue
+
+                if command_poll_timeout > 0:
+                    await asyncio.sleep(command_poll_timeout)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("admin command listener error")
+                await asyncio.sleep(5)
+
+
 async def check_source(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
     source: dict[str, Any],
     telegram_token: str,
-    telegram_chat_id: str,
+    telegram_chat_ids: list[str],
     dry_run: bool,
 ) -> list[ChangelogEntry]:
     source_id = source["id"]
@@ -453,11 +1202,14 @@ async def check_source(
     # Sources normally return newest first. Send oldest first if multiple appeared between polls.
     for entry in reversed(new_entries):
         msg = format_message(source, entry)
-        if dry_run:
-            LOG.info("[%s] DRY RUN would post %s:\n%s", source_id, entry.item_id, msg)
-        else:
-            await send_telegram_message(client, telegram_token, telegram_chat_id, msg)
-            LOG.info("[%s] posted %s", source_id, entry.item_id)
+        if not telegram_chat_ids:
+            LOG.info("[%s] no target chats configured for %s", source_id, entry.item_id)
+        for chat_id in telegram_chat_ids:
+            if dry_run:
+                LOG.info("[%s] DRY RUN would post %s to %s:\n%s", source_id, entry.item_id, chat_id, msg)
+            else:
+                await send_telegram_message(client, telegram_token, chat_id, msg)
+                LOG.info("[%s] posted %s to %s", source_id, entry.item_id, chat_id)
         mark_posted(conn, source_id, entry.item_id)
         posted_entries.append(entry)
 
@@ -490,33 +1242,50 @@ async def send_summary(
 async def send_summaries(
     client: httpx.AsyncClient,
     telegram_token: str,
-    chat_ids: list[str],
-    entries: list[tuple[dict[str, Any], ChangelogEntry]],
+    entries_by_chat: dict[str, list[tuple[dict[str, Any], ChangelogEntry]]],
     dry_run: bool,
 ) -> None:
-    if not entries:
+    if not entries_by_chat:
         return
-    for chat_id in chat_ids:
+    for chat_id, entries in entries_by_chat.items():
         await send_summary(client, telegram_token, chat_id, entries, dry_run)
 
 
-async def check_all(config_path: str, db_path: str, dry_run: bool = False) -> None:
+async def check_all(
+    config_path: str,
+    db_path: str,
+    dry_run: bool = False,
+    routing_state: RoutingState | None = None,
+    force_routing_reload: bool = False,
+) -> None:
     load_dotenv()
     config = load_config(config_path)
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_ids = parse_chat_ids(os.getenv("TELEGRAM_CHAT_ID", ""))
-    summary_chat_ids = parse_chat_ids(os.getenv("SUMMARY_CHAT_IDS", ""))
+    routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+    routing_sources = config["sources"]
+    source_ids = collect_source_ids(routing_sources)
+    if routing_state is None:
+        routing_state = RoutingState(
+            db_path=db_path,
+            source_config_path=routing_config_path,
+            ttl_seconds=0,
+        )
 
-    if not summary_chat_ids:
-        summary_chat_ids = telegram_chat_ids
+    routing = routing_state.get(source_ids, force_reload=force_routing_reload)
+    source_to_chat = build_source_to_chat_map(routing_sources, routing)
 
-    if not dry_run and (not telegram_token or not telegram_chat_ids):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+    if not routing.chats:
+        raise RuntimeError("routing config does not define any chats")
 
-    # Keep backwards compatibility: one list for all full messages as before.
-    main_chat_id = telegram_chat_ids[0] if telegram_chat_ids else ""
+    enabled_chat_ids = {chat_id for chat_id, chat in routing.chats.items() if chat.enabled}
+    if not enabled_chat_ids:
+        raise RuntimeError("routing config has no enabled chats")
 
-    summary_items: list[tuple[dict[str, Any], ChangelogEntry]] = []
+    if not dry_run and (not telegram_token):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
+
+    summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
+    accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
     conn = db_connect(db_path)
     headers = {
@@ -524,47 +1293,140 @@ async def check_all(config_path: str, db_path: str, dry_run: bool = False) -> No
         "Accept": "text/html,text/markdown,text/plain,application/json,*/*",
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+        if not dry_run:
+            chat_access = await validate_routing_chats(client, telegram_token, routing)
+            accessible_chat_ids = {
+                chat_id for chat_id in enabled_chat_ids if chat_access.get(chat_id)
+            }
+
+            if accessible_chat_ids != enabled_chat_ids:
+                skipped_chat_ids = sorted(enabled_chat_ids - accessible_chat_ids)
+                for skipped_chat_id in skipped_chat_ids:
+                    LOG.warning("chat %s is disabled for this run due to access validation", skipped_chat_id)
+
+            if not accessible_chat_ids:
+                LOG.warning("no enabled chats passed Telegram access validation; messages will not be sent")
+
         for source in config["sources"]:
             if source.get("enabled", True) is False:
                 LOG.info("[%s] disabled; skipping", source.get("id", "unknown"))
                 continue
             try:
+                configured_chat_ids = source_to_chat.get(source["id"], [])
+                target_chat_ids = (
+                    configured_chat_ids
+                    if dry_run
+                    else [chat_id for chat_id in configured_chat_ids if chat_id in accessible_chat_ids]
+                )
+
+                if configured_chat_ids != target_chat_ids and configured_chat_ids:
+                    skipped_chat_ids = [chat_id for chat_id in configured_chat_ids if chat_id not in accessible_chat_ids]
+                    LOG.warning(
+                        "[%s] skipped %d chat(s) without send rights: %s",
+                        source.get("id", "unknown"),
+                        len(skipped_chat_ids),
+                        ", ".join(skipped_chat_ids),
+                    )
+
                 posted_entries = await check_source(
                     conn,
                     client,
                     source,
                     telegram_token,
-                    main_chat_id,
+                    target_chat_ids,
                     dry_run=dry_run,
                 )
-                summary_items.extend((source, entry) for entry in posted_entries)
+                for chat_id in target_chat_ids:
+                    chat = routing.chats.get(chat_id)
+                    if not chat or not chat.send_summary:
+                        continue
+                    summary_items_by_chat[chat_id].extend((source, entry) for entry in posted_entries)
             except Exception:
                 LOG.exception("[%s] failed", source.get("id", "unknown"))
 
-        await send_summaries(client, telegram_token, summary_chat_ids, summary_items, dry_run=dry_run)
+        await send_summaries(
+            client,
+            telegram_token,
+            summary_items_by_chat,
+            dry_run=dry_run,
+        )
     conn.close()
 
 
 async def run_scheduler(config_path: str, db_path: str, dry_run: bool) -> None:
     config = load_config(config_path)
     poll_minutes = int(config.get("poll_minutes", 30))
+    poll_seconds = max(1, poll_minutes * 60)
+    routing_ttl_seconds = int(os.getenv("ROUTING_RELOAD_TTL_SECONDS", "0") or "0")
+    if routing_ttl_seconds < 0:
+        raise RuntimeError("ROUTING_RELOAD_TTL_SECONDS must be >= 0")
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
-        check_all,
-        trigger="interval",
-        minutes=poll_minutes,
-        args=[config_path, db_path, dry_run],
-        max_instances=1,
-        coalesce=True,
+    routing_state = RoutingState(
+        db_path=db_path,
+        source_config_path=os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml"),
+        ttl_seconds=routing_ttl_seconds,
     )
-    scheduler.start()
 
-    LOG.info("scheduler started; interval=%s minutes", poll_minutes)
-    await check_all(config_path, db_path, dry_run=dry_run)
+    loop = asyncio.get_running_loop()
+    reload_requested = asyncio.Event()
 
-    stop_event = asyncio.Event()
-    await stop_event.wait()
+    def _request_routing_reload() -> None:
+        if not reload_requested.is_set():
+            LOG.info("received hot-reload signal, forcing routing state reload")
+            reload_requested.set()
+
+    for sig_name in ("SIGHUP", "SIGUSR1"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_routing_reload)
+        except (RuntimeError, OSError):
+            LOG.debug("signal handler for %s is not supported", sig_name)
+
+    LOG.info("scheduler loop started; interval=%s minutes, routing_ttl=%s seconds", poll_minutes, routing_ttl_seconds)
+
+    admin_command_task = None
+    if not dry_run and telegram_token:
+        admin_command_task = asyncio.create_task(
+            run_admin_command_listener(
+                telegram_token=telegram_token,
+                db_path=db_path,
+                config_path=config_path,
+                routing_state=routing_state,
+                reload_requested=reload_requested,
+            )
+        )
+
+    try:
+        while True:
+            force = reload_requested.is_set()
+            if force:
+                reload_requested.clear()
+
+            try:
+                await check_all(
+                    config_path,
+                    db_path,
+                    dry_run=dry_run,
+                    routing_state=routing_state,
+                    force_routing_reload=force,
+                )
+            except Exception:
+                LOG.exception("cycle failed")
+
+            try:
+                await asyncio.wait_for(reload_requested.wait(), timeout=poll_seconds)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        if admin_command_task is not None:
+            admin_command_task.cancel()
+            try:
+                await admin_command_task
+            except asyncio.CancelledError:
+                pass
 
 
 def parse_args() -> argparse.Namespace:

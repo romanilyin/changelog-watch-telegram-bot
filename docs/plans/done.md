@@ -1,0 +1,21 @@
+# Done
+
+- Добавлена разметка и форматирование Telegram-сообщений + префиксы сводки.
+- Собран каркас routing в `bot.py` с источником `products.yaml` + state из БД.
+- Добавлены вспомогательные нормализации для YAML-конфигураций.
+- Подготовлены новые плановые документы для следующего шага работ.
+- Реализована runtime-интеграция routing через SQLite:
+  - `check_all` грузит маршруты из БД;
+  - при первом запуске данные автоматически импортируются из `admin-routing.yaml`;
+  - отправка релизов идёт по списку целевых чатов;
+  - сводка формируется отдельно для каждого чата с `send_summary`.
+- Обновлён `.env.example`, `README.md`, `docs/INSTALL_WSL.md`, `docs/ADMIN_DESIGN.md` на SQL-based runtime-routing.
+- Реализованы проверки доступности чатов через Telegram API (`getMe`, `getChat`, `getChatMember`).
+- Реализован hot-reload routing state:
+  - TTL-перезагрузка из SQLite;
+  - сигналами `SIGHUP`/`SIGUSR1` + `/reload`.
+- Реализована базовая админ-команда по Telegram polling:
+  - `/reload`
+  - `/subscribe <source_id> [chat_id]`
+  - `/unsubscribe <source_id> [chat_id]`
+- Переведена routing-логика в SQLite с автоимпортом `admin-routing.yaml` как seed (`DB_PATH`).

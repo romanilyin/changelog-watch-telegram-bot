@@ -13,6 +13,7 @@
 ```text
 bot.py
 products.yaml
+admin-routing.yaml (seed-файл для начальной инициализации routing-хранилища)
 requirements.txt
 .env.example
 docs/INSTALL_WSL.md
@@ -28,11 +29,51 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 nano .env
+cp admin-routing.example.yaml admin-routing.yaml
+nano admin-routing.yaml
 python bot.py --once
 python bot.py
 ```
 
-Переменная `SUMMARY_CHAT_IDS` позволяет отправлять сводный дайджест новых релизов в отдельные чаты. Если не указать, сводка уходит в тот же `TELEGRAM_CHAT_ID`.
+Перезагрузка маршрутизации в рантайме:
+
+- `ROUTING_RELOAD_TTL_SECONDS=0` — читать routing state из SQLite каждый цикл.
+- `ROUTING_RELOAD_TTL_SECONDS=<N>` — кэшировать routing state `N` секунд.
+- `kill -HUP <PID>` или `kill -USR1 <PID>` — форсированно перечитать routing state из SQLite и выполнить новый проход.
+
+Рассылка строится по routing state в SQLite (`DB_PATH`).
+`ROUTING_CONFIG_PATH` используется только как seed для первого импорта в БД.
+Для каждого чата можно указать конкретные источники (`sources`) и группы источников (`groups`).
+Сводка отправляется только туда, где `send_summary: true`.
+Ниже пример seed-конфига для `admin-routing.yaml`:
+
+```yaml
+admins:
+  - 12345678
+
+source_groups:
+  core:
+    - opencode_changelog
+    - openchamber_changelog
+
+chats:
+  - chat_id: -1001234567890
+    title: Основной канал
+    groups:
+      - core
+    sources: []
+    send_summary: true
+ ```
+
+### Админ-команды
+
+- `/reload` — перезагрузить конфиг маршрутизации без перезапуска процесса.
+- `/subscribe <source_id> [chat_id]` — добавить источник в чат.
+- `/unsubscribe <source_id> [chat_id]` — убрать источник из чата.
+
+После подключения администратора все изменения `/subscribe` и `/unsubscribe` пишутся в SQLite.
+
+Если `chat_id` не указан, используется текущий чат.
 
 При первом запуске источники с `post_on_first_run: false` будут только запомнены в SQLite, без отправки старых версий в чат.
 
@@ -71,9 +112,9 @@ python bot.py --once --dry-run
 
 В dry-run отдельными строками логируются и обычные сообщения, и сводка (`[summary] DRY RUN would post aggregate`), без вызовов Telegram API.
 
-## Сброс памяти о публикациях
+## Сброс состояния
 
-Память хранится в `data/posted.sqlite3`. Для полного сброса можно остановить бота и удалить файл:
+Состояние публикаций и routing-хранилище лежат в `data/posted.sqlite3`. Для полного сброса (публикаций и подписок) можно остановить бота и удалить файл:
 
 ```bash
 rm data/posted.sqlite3

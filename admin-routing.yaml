@@ -1,0 +1,16 @@
+admins:
+  - 12345678
+
+source_groups:
+  core:
+    - opencode_changelog
+    - openchamber_changelog
+
+chats:
+  - chat_id: -1001234567890
+    title: Основной канал
+    groups:
+      - core
+    sources:
+      - codenomad_releases
+    send_summary: true

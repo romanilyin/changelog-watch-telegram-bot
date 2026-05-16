@@ -1,0 +1,29 @@
+# Админский routing для рассылки источников по чатам.
+# Скопируй в admin-routing.yaml и подставь реальные Telegram ID.
+
+admins:
+  - 12345678
+
+source_groups:
+  core:
+    - opencode_changelog
+    - openchamber_changelog
+  releases:
+    - codenomad_releases
+
+chats:
+  - chat_id: -1001234567890
+    title: Основной канал
+    groups:
+      - core
+    sources: []
+    enabled: true
+    send_summary: true
+
+  - chat_id: -1009876543210
+    title: Резервный канал
+    groups: []
+    sources:
+      - codenomad_releases
+    enabled: true
+    send_summary: false

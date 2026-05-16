@@ -47,16 +47,23 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 nano .env
+cp admin-routing.example.yaml admin-routing.yaml
+nano admin-routing.yaml
 ```
 
 Заполни:
 
 ```env
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
-TELEGRAM_CHAT_ID=-1001234567890
+DB_PATH=data/posted.sqlite3
+ROUTING_CONFIG_PATH=admin-routing.yaml
+# ROUTING_CONFIG_PATH используется как seed для первого импорта в БД.
+ROUTING_RELOAD_TTL_SECONDS=0
+ADMIN_POLL_TIMEOUT=25
+ADMIN_COMMAND_POLL_SECONDS=2
 ```
 
-### Как узнать `TELEGRAM_CHAT_ID`
+### Как узнать `chat_id` для `admin-routing.yaml`
 
 Вариант для проверки:
 
@@ -97,6 +104,9 @@ python bot.py --once --dry-run
 source .venv/bin/activate
 python bot.py
 ```
+
+При запуске в фоне через постоянный процесс доступны команды `/reload`, `/subscribe`, `/unsubscribe`.
+Они доступны админам из routing state (seed берётся из `admin-routing.yaml#admins` при первом импорте).
 
 Оставь окно WSL открытым. Бот будет проверять источники раз в 30 минут.
 
