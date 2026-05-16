@@ -1832,7 +1832,18 @@ def format_message_with_ai_summary(
     if not lines:
         return message
 
-    lines.insert(1, f"<b>Кратко:</b> {html.escape(ai_summary)}")
+    summary_line = f"<b>Кратко:</b> {html.escape(ai_summary)}"
+    date_prefix = "<b>Дата:</b> "
+    insertion_index = 0
+
+    for index, line in enumerate(lines):
+        if line.startswith(date_prefix):
+            insertion_index = index
+            break
+
+    # Keep summary in the order: header -> (title/date) -> summary -> body.
+    # Use visual separators for readability.
+    lines[insertion_index + 1 : insertion_index + 1] = ["—", summary_line, "—"]
     return "\n".join(lines)
 
 
