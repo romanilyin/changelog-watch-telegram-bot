@@ -265,9 +265,6 @@ def ensure_routing_state_seeded(
     source_config_path: str | None,
     source_ids: set[str],
 ) -> None:
-    if routing_has_data(conn):
-        return
-
     if source_config_path is None:
         raise RuntimeError("routing state is empty and ROUTING_CONFIG_PATH is not set")
 
@@ -275,12 +272,15 @@ def ensure_routing_state_seeded(
     if not source_path.exists():
         raise RuntimeError(f"routing seed file not found: {source_config_path}")
 
+    # Keep routing admins/chats in sync with seed config while preserving
+    # runtime changes (e.g. /subscribe) stored in SQLite.
     route_config = load_routing_config(source_path, source_ids)
     import_routing_config_to_db(conn, route_config)
 
 
 def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig) -> None:
     admin_alias_lookup: dict[str, str] = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
+    conn.execute("DELETE FROM routing_admins")
     for admin_id in routing.admins:
         admin_alias = admin_alias_lookup.get(admin_id)
         conn.execute(
