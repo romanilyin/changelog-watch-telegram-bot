@@ -12,3 +12,6 @@
 - [x] Добавить валидацию дублирующихся `chat_id` при чтении routing config.
 - [x] Добавить админские команды `/reload`, `/subscribe`, `/unsubscribe` через Telegram polling.
 - [x] Перевести `admin-routing.yaml` в SQLite-рутинг: seed из файла и хранение подписок/админов в `data/posted.sqlite3`.
+- [x] Добавить пер-чатовое расписание для сводок: `immediate`, `daily`, `weekly`.
+- [x] Добавить alias для чатов/админов и резолв `chat_id|alias` в командах.
+- [x] Реализовать очередь сводок `summary_queue` в `DB_PATH` для отложенной доставки.

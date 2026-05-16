@@ -9,6 +9,10 @@
   - при первом запуске данные автоматически импортируются из `admin-routing.yaml`;
   - отправка релизов идёт по списку целевых чатов;
   - сводка формируется отдельно для каждого чата с `send_summary`.
+- Реализована отложенная доставка per-chat сводок через `summary_queue`:
+  - `summary_schedule` поддерживает `immediate`, `daily`, `weekly`;
+  - для scheduled сводок хранится состояние `last_summary_sent_at`;
+  - алиасы чатов/админов поддерживаются в seed и CLI-командах (`chat_id|alias`).
 - Обновлён `.env.example`, `README.md`, `docs/INSTALL_WSL.md`, `docs/ADMIN_DESIGN.md` на SQL-based runtime-routing.
 - Реализованы проверки доступности чатов через Telegram API (`getMe`, `getChat`, `getChatMember`).
 - Реализован hot-reload routing state:
@@ -16,6 +20,6 @@
   - сигналами `SIGHUP`/`SIGUSR1` + `/reload`.
 - Реализована базовая админ-команда по Telegram polling:
   - `/reload`
-  - `/subscribe <source_id> [chat_id]`
-  - `/unsubscribe <source_id> [chat_id]`
+  - `/subscribe <source_id> [chat_id|alias]`
+  - `/unsubscribe <source_id> [chat_id|alias]`
 - Переведена routing-логика в SQLite с автоимпортом `admin-routing.yaml` как seed (`DB_PATH`).

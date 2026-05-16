@@ -10,7 +10,8 @@ source_groups:
     - unity_coplay_releases
 
 chats:
-  - chat_id: 185073278
+  - chat_id: -1001234567890
+    alias: main
     title: Основной канал
     groups:
       - core
@@ -18,3 +19,5 @@ chats:
     sources:
       - codenomad_releases
     send_summary: true
+    summary_schedule:
+      mode: immediate

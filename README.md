@@ -49,7 +49,8 @@ python bot.py
 
 ```yaml
 admins:
-  - 12345678
+  - id: 12345678
+    alias: maintainer
 
 source_groups:
   core:
@@ -58,18 +59,38 @@ source_groups:
 
 chats:
   - chat_id: -1001234567890
+    alias: main
     title: Основной канал
     groups:
       - core
     sources: []
     send_summary: true
- ```
+    summary_schedule:
+      mode: immediate
+  - chat_id: -1009876543210
+    alias: backup
+    title: Резервный канал
+    groups: []
+    sources:
+      - codenomad_releases
+    enabled: true
+    send_summary: false
+    summary_schedule:
+      mode: weekly
+      time: "20:00"
+      weekday: monday
+```
+
+Для `summary_schedule` поддерживаются режимы:
+- `immediate` (без отсрочки)
+- `daily` (по `time`, отправка каждый день после дедлайна)
+- `weekly` (по `time` + `weekday`)
 
 ### Админ-команды
 
 - `/reload` — перезагрузить конфиг маршрутизации без перезапуска процесса.
-- `/subscribe <source_id> [chat_id]` — добавить источник в чат.
-- `/unsubscribe <source_id> [chat_id]` — убрать источник из чата.
+- `/subscribe <source_id> [chat_id|alias]` — добавить источник в чат.
+- `/unsubscribe <source_id> [chat_id|alias]` — убрать источник из чата.
 
 После подключения администратора все изменения `/subscribe` и `/unsubscribe` пишутся в SQLite.
 

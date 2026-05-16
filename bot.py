@@ -19,7 +19,7 @@ import re
 import signal
 from collections import defaultdict
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from time import monotonic
@@ -38,6 +38,56 @@ MD_VERSION_HEADING_RE = re.compile(
     r"^##\s+\[?(?P<version>[^\]\n]+)\]?\s*(?:-\s*(?P<date>\d{4}-\d{2}-\d{2}))?\s*$",
     re.MULTILINE,
 )
+SUMMARY_TIME_RE = re.compile(r"^(?P<hour>\d{1,2}):(?P<minute>[0-5]\d)$")
+WEEKDAY_NAMES = {
+    "monday": 0,
+    "mon": 0,
+    "понедельник": 0,
+    "пн": 0,
+    "tuesday": 1,
+    "tue": 1,
+    "вторник": 1,
+    "вт": 1,
+    "wednesday": 2,
+    "wed": 2,
+    "среда": 2,
+    "ср": 2,
+    "thursday": 3,
+    "thu": 3,
+    "thurs": 3,
+    "четверг": 3,
+    "чт": 3,
+    "friday": 4,
+    "fri": 4,
+    "пятница": 4,
+    "пт": 4,
+    "saturday": 5,
+    "sat": 5,
+    "суббота": 5,
+    "сб": 5,
+    "sunday": 6,
+    "sun": 6,
+    "воскресенье": 6,
+    "вс": 6,
+}
+
+
+@dataclass(frozen=True)
+class SummarySchedule:
+    mode: str
+    time: str
+    weekday: int | None = None
+
+    @classmethod
+    def immediate(cls) -> "SummarySchedule":
+        return cls(mode="immediate", time="00:00", weekday=None)
+
+
+def normalize_alias(value: Any) -> str | None:
+    alias = normalize_string(value)
+    if not alias:
+        return None
+    return alias.lower()
 
 
 @dataclass(frozen=True)
@@ -57,13 +107,17 @@ class ChatRouting:
     groups: set[str]
     source_ids: set[str]
     title: str | None = None
+    alias: str | None = None
     enabled: bool = True
     send_summary: bool = True
+    summary_schedule: SummarySchedule = field(default_factory=SummarySchedule.immediate)
+    last_summary_sent_at: str | None = None
 
 
 @dataclass(frozen=True)
 class RoutingConfig:
     admins: set[str]
+    admin_aliases: dict[str, str]
     source_groups: dict[str, set[str]]
     chats: dict[str, ChatRouting]
 
@@ -187,10 +241,16 @@ def ensure_routing_state_seeded(
 
 
 def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig) -> None:
+    admin_alias_lookup: dict[str, str] = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
     for admin_id in routing.admins:
+        admin_alias = admin_alias_lookup.get(admin_id)
         conn.execute(
-            "INSERT OR IGNORE INTO routing_admins(user_id) VALUES (?)",
-            (admin_id,),
+            "INSERT OR IGNORE INTO routing_admins(user_id, alias) VALUES (?, ?)",
+            (admin_id, admin_alias),
+        )
+        conn.execute(
+            "UPDATE routing_admins SET alias = ? WHERE user_id = ?",
+            (admin_alias, admin_id),
         )
 
     for group_name, source_ids in routing.source_groups.items():
@@ -206,8 +266,31 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
 
     for chat in routing.chats.values():
         conn.execute(
-            "INSERT OR REPLACE INTO routing_chats(chat_id, title, enabled, send_summary) VALUES (?, ?, ?, ?)",
-            (chat.chat_id, chat.title, int(chat.enabled), int(chat.send_summary)),
+            """
+            INSERT INTO routing_chats(
+                chat_id, title, enabled, send_summary, alias,
+                summary_mode, summary_time, summary_weekday
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title,
+                enabled = excluded.enabled,
+                send_summary = excluded.send_summary,
+                alias = excluded.alias,
+                summary_mode = excluded.summary_mode,
+                summary_time = excluded.summary_time,
+                summary_weekday = excluded.summary_weekday
+            """,
+            (
+                chat.chat_id,
+                chat.title,
+                int(chat.enabled),
+                int(chat.send_summary),
+                chat.alias,
+                chat.summary_schedule.mode,
+                chat.summary_schedule.time,
+                chat.summary_schedule.weekday,
+            ),
         )
 
         for group_name in sorted(chat.groups):
@@ -319,13 +402,215 @@ def normalize_string(value: Any) -> str:
     return str(value).strip()
 
 
+def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {
+        row[1]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def parse_admin_entry(raw_admin: Any, idx: int) -> tuple[str, str | None]:
+    if isinstance(raw_admin, dict):
+        raw_admin_id = (
+            raw_admin.get("id")
+            if raw_admin.get("id") is not None
+            else (raw_admin.get("user_id") if raw_admin.get("user_id") is not None else raw_admin.get("chat_id"))
+        )
+        alias = normalize_alias(raw_admin.get("alias"))
+        if raw_admin_id is None:
+            raise ValueError(f"admins[{idx}] must include id (or user_id) when specified as object")
+        return normalize_chat_id(raw_admin_id, f"admins[{idx}]"), alias
+
+    return normalize_chat_id(raw_admin, f"admins[{idx}]"), None
+
+
+def validate_summary_time(raw_time: Any, context: str) -> tuple[int, int]:
+    time_text = normalize_string(raw_time)
+    if not time_text:
+        raise ValueError(f"{context} summary schedule requires time like HH:MM")
+
+    match = SUMMARY_TIME_RE.match(time_text)
+    if not match:
+        raise ValueError(f"{context} summary schedule time is invalid: {time_text!r}")
+
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if hour < 0 or hour > 23:
+        raise ValueError(f"{context} summary schedule hour must be 0..23: {time_text!r}")
+    return hour, minute
+
+
+def parse_weekday(raw_weekday: Any, context: str) -> int:
+    weekday_text = normalize_string(raw_weekday)
+    if not weekday_text:
+        raise ValueError(f"{context} summary schedule requires weekday")
+
+    if weekday_text.isdigit():
+        weekday_value = int(weekday_text)
+        if 0 <= weekday_value <= 6:
+            return weekday_value
+        if 1 <= weekday_value <= 7:
+            return (weekday_value - 1)
+        raise ValueError(f"{context} weekday is out of range (0-6 or 1-7): {weekday_text}")
+
+    normalized = weekday_text.lower()
+    if normalized in WEEKDAY_NAMES:
+        return WEEKDAY_NAMES[normalized]
+    raise ValueError(f"{context} summary schedule has unknown weekday: {weekday_text!r}")
+
+
+def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
+    if raw_schedule is None:
+        return SummarySchedule.immediate()
+
+    if isinstance(raw_schedule, str):
+        mode = normalize_string(raw_schedule).lower()
+        if not mode:
+            return SummarySchedule.immediate()
+        if mode not in {"immediate", "on", "enabled", "true"}:
+            raise ValueError(f"{context} summary schedule mode is invalid: {mode!r}")
+        return SummarySchedule.immediate()
+
+    if not isinstance(raw_schedule, dict):
+        raise ValueError(f"{context} summary_schedule must be an object")
+
+    mode = normalize_string(raw_schedule.get("mode") or raw_schedule.get("kind") or raw_schedule.get("frequency"))
+    if not mode:
+        mode = "immediate"
+    mode = mode.lower()
+    if mode not in {"immediate", "daily", "weekly"}:
+        raise ValueError(f"{context} summary_schedule.mode must be one of immediate|daily|weekly: {mode!r}")
+
+    if mode == "immediate":
+        return SummarySchedule.immediate()
+
+    hour, minute = validate_summary_time(
+        raw_schedule.get("time") or raw_schedule.get("at"),
+        context,
+    )
+    normalized_time = f"{hour:02d}:{minute:02d}"
+
+    if mode == "daily":
+        return SummarySchedule(mode="daily", time=normalized_time, weekday=None)
+
+    weekday = parse_weekday(raw_schedule.get("weekday"), context)
+    return SummarySchedule(mode="weekly", time=normalized_time, weekday=weekday)
+
+
+def parse_summary_schedule_from_db(row: sqlite3.Row, chat_id: str) -> SummarySchedule:
+    summary_mode = normalize_string(row["summary_mode"]) if "summary_mode" in row.keys() else "immediate"
+    summary_time = normalize_string(row["summary_time"]) if "summary_time" in row.keys() else "00:00"
+    weekday = row["summary_weekday"] if "summary_weekday" in row.keys() else None
+
+    try:
+        return parse_summary_schedule(
+            {
+                "mode": summary_mode or "immediate",
+                "time": summary_time,
+                "weekday": weekday,
+            },
+            f"chat {chat_id}",
+        )
+    except ValueError as exc:
+        LOG.warning("chat %s has invalid summary schedule in DB, fallback to immediate: %s", chat_id, exc)
+        return SummarySchedule.immediate()
+
+
+def parse_sqlite_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def is_summary_due(schedule: SummarySchedule, now: datetime, last_sent_at: str | None) -> bool:
+    if schedule.mode == "immediate":
+        return True
+
+    parsed_time = SUMMARY_TIME_RE.match(schedule.time)
+    if not parsed_time:
+        return False
+
+    hour = int(parsed_time.group("hour"))
+    minute = int(parsed_time.group("minute"))
+
+    if schedule.mode == "daily":
+        scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if schedule.time and now < scheduled_dt:
+            scheduled_dt -= timedelta(days=1)
+
+        if not last_sent_at:
+            return True
+        last_sent_dt = parse_sqlite_datetime(last_sent_at)
+        if last_sent_dt is None:
+            return True
+        return last_sent_dt < scheduled_dt
+
+    if schedule.mode == "weekly":
+        if schedule.weekday is None:
+            return False
+        if schedule.weekday != now.weekday():
+            return False
+
+        scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if not last_sent_at:
+            return now >= scheduled_dt
+
+        last_sent_dt = parse_sqlite_datetime(last_sent_at)
+        if last_sent_dt is None:
+            return now >= scheduled_dt
+        return last_sent_dt < scheduled_dt
+
+    return False
+
+
+def get_chat_alias_lookup(routing: RoutingConfig) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for chat in routing.chats.values():
+        if not chat.alias:
+            continue
+        aliases[chat.alias] = chat.chat_id
+    return aliases
+
+
+def resolve_chat_identifier(value: str, routing: RoutingConfig) -> str | None:
+    normalized = normalize_string(value)
+    if not normalized:
+        return None
+
+    normalized_alias = normalized.lower()
+    for chat in routing.chats.values():
+        if chat.alias == normalized_alias:
+            return chat.chat_id
+
+    try:
+        return normalize_chat_id(normalized, "chat identifier")
+    except ValueError:
+        return None
+
+
 def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig:
     data = load_yaml_file(path)
 
     admins_raw = data.get("admins", [])
     if not isinstance(admins_raw, list):
         raise ValueError("routing config 'admins' must be a list")
-    admins = {normalize_chat_id(admin, "admins") for admin in admins_raw}
+
+    admins: set[str] = set()
+    admin_aliases: dict[str, str] = {}
+    for idx, raw_admin in enumerate(admins_raw, start=1):
+        admin_id, admin_alias = parse_admin_entry(raw_admin, idx)
+        if admin_id in admins:
+            raise ValueError(f"duplicate admin id {admin_id} in routing config")
+
+        if admin_alias:
+            if admin_alias in admin_aliases:
+                raise ValueError(f"duplicate admin alias '{admin_alias}' in routing config")
+            admin_aliases[admin_alias] = admin_id
+
+        admins.add(admin_id)
 
     source_groups_raw = data.get("source_groups", {})
     if not isinstance(source_groups_raw, dict):
@@ -377,8 +662,14 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
             chat_source_ids.add(source_id)
 
         title = normalize_string(raw_chat.get("title")) or None
+        alias = normalize_alias(raw_chat.get("alias"))
         enabled = bool(raw_chat.get("enabled", True))
         send_summary = bool(raw_chat.get("send_summary", True))
+        summary_schedule = parse_summary_schedule(raw_chat.get("summary_schedule"), f"chats[{idx}]")
+
+        for existing_chat in chats.values():
+            if existing_chat.alias and alias and existing_chat.alias == alias:
+                raise ValueError(f"duplicate chat alias '{alias}'")
 
         if chat_id in chats:
             raise ValueError(f"duplicate chat entry for chat_id {chat_id}")
@@ -388,19 +679,31 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
             groups=chat_groups,
             source_ids=chat_source_ids,
             title=title,
+            alias=alias,
             enabled=enabled,
             send_summary=send_summary,
+            summary_schedule=summary_schedule,
         )
 
-    return RoutingConfig(admins=admins, source_groups=source_groups, chats=chats)
+    return RoutingConfig(admins=admins, admin_aliases=admin_aliases, source_groups=source_groups, chats=chats)
 
 
 def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) -> RoutingConfig:
-    admins_raw = [
-        normalize_chat_id(row[0], "admins")
-        for row in conn.execute("SELECT user_id FROM routing_admins ORDER BY user_id").fetchall()
-    ]
-    admins = set(admins_raw)
+    admins: set[str] = set()
+    admin_aliases: dict[str, str] = {}
+
+    admin_cursor = conn.execute("SELECT * FROM routing_admins ORDER BY user_id")
+    for row in admin_cursor.fetchall():
+        admin_id = normalize_chat_id(row["user_id"], "admins")
+        if admin_id in admins:
+            raise ValueError(f"duplicate admin id {admin_id} in routing DB")
+        admins.add(admin_id)
+
+        alias = normalize_alias(row["alias"]) if "alias" in row.keys() and row["alias"] is not None else None
+        if alias:
+            if alias in admin_aliases:
+                raise ValueError(f"duplicate admin alias '{alias}' in routing DB")
+            admin_aliases[alias] = admin_id
 
     source_groups: dict[str, set[str]] = {}
     for raw_group_name in conn.execute("SELECT group_name FROM routing_source_groups ORDER BY group_name").fetchall():
@@ -415,11 +718,8 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
         source_groups[str(group_name)].add(source_id)
 
     chats: dict[str, ChatRouting] = {}
-    for idx, raw_chat in enumerate(
-        conn.execute("SELECT chat_id, title, enabled, send_summary FROM routing_chats ORDER BY chat_id"),
-        start=1,
-    ):
-        chat_id = normalize_chat_id(raw_chat[0], f"chats[{idx}].chat_id")
+    for idx, raw_chat in enumerate(conn.execute("SELECT * FROM routing_chats ORDER BY chat_id"), start=1):
+        chat_id = normalize_chat_id(raw_chat["chat_id"], f"chats[{idx}].chat_id")
         raw_chat_groups = [
             normalize_string(row[0])
             for row in conn.execute(
@@ -450,9 +750,16 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
                 raise ValueError(f"chat {chat_id} uses unknown source '{source_id}'")
             chat_source_ids.add(source_id)
 
-        title = normalize_string(raw_chat[1]) or None
-        enabled = bool(raw_chat[2])
-        send_summary = bool(raw_chat[3])
+        title = normalize_string(raw_chat["title"]) or None
+        enabled = bool(raw_chat["enabled"])
+        send_summary = bool(raw_chat["send_summary"])
+        alias = normalize_alias(raw_chat["alias"]) if raw_chat["alias"] is not None else None
+        summary_schedule = parse_summary_schedule_from_db(raw_chat, chat_id)
+        last_summary_sent_at = normalize_string(raw_chat["last_summary_sent_at"]) or None
+
+        for existing_chat in chats.values():
+            if existing_chat.alias and alias and existing_chat.alias == alias:
+                raise ValueError(f"duplicate chat alias '{alias}'")
 
         if chat_id in chats:
             raise ValueError(f"duplicate chat entry for chat_id {chat_id}")
@@ -462,11 +769,19 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
             groups=chat_groups,
             source_ids=chat_source_ids,
             title=title,
+            alias=alias,
             enabled=enabled,
             send_summary=send_summary,
+            summary_schedule=summary_schedule,
+            last_summary_sent_at=last_summary_sent_at,
         )
 
-    return RoutingConfig(admins=admins, source_groups=source_groups, chats=chats)
+    return RoutingConfig(
+        admins=admins,
+        admin_aliases=admin_aliases,
+        source_groups=source_groups,
+        chats=chats,
+    )
 
 
 def build_source_to_chat_map(sources: list[dict[str, Any]], routing: RoutingConfig) -> dict[str, list[str]]:
@@ -510,10 +825,48 @@ def collect_source_ids(sources: list[dict[str, Any]]) -> set[str]:
     return source_ids
 
 
+def ensure_routing_columns(conn: sqlite3.Connection) -> None:
+    admin_columns = table_columns(conn, "routing_admins")
+    if "alias" not in admin_columns:
+        conn.execute("ALTER TABLE routing_admins ADD COLUMN alias TEXT")
+
+    chat_columns = table_columns(conn, "routing_chats")
+    if "alias" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN alias TEXT")
+    if "summary_mode" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_mode TEXT NOT NULL DEFAULT 'immediate'")
+    if "summary_time" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_time TEXT NOT NULL DEFAULT '00:00'")
+    if "summary_weekday" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_weekday INTEGER")
+    if "last_summary_sent_at" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN last_summary_sent_at TEXT")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS summary_queue (
+            chat_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            item_title TEXT NOT NULL,
+            item_version TEXT NOT NULL,
+            item_date TEXT,
+            item_url TEXT NOT NULL,
+            item_is_prerelease INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, source_id, item_id),
+            FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_queue_chat_id ON summary_queue(chat_id)")
+
+
 def db_connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(
         """
@@ -589,6 +942,7 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
         )
         """
     )
+    ensure_routing_columns(conn)
     conn.commit()
     return conn
 
@@ -641,6 +995,93 @@ def mark_many_posted(conn: sqlite3.Connection, source_id: str, entries: list[Cha
         VALUES(?, ?, ?)
         """,
         [(source_id, entry.item_id, now) for entry in entries],
+    )
+    conn.commit()
+
+
+def enqueue_summary_items(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    source_id: str,
+    entries: list[ChangelogEntry],
+) -> None:
+    if not entries:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO summary_queue(
+            chat_id,
+            source_id,
+            item_id,
+            item_title,
+            item_version,
+            item_date,
+            item_url,
+            item_is_prerelease,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                chat_id,
+                source_id,
+                entry.item_id,
+                entry.title,
+                entry.version,
+                entry.date,
+                entry.url,
+                1 if entry.is_prerelease else 0,
+                now,
+            )
+            for entry in entries
+        ],
+    )
+    conn.commit()
+
+
+def load_summary_queue_items(
+    conn: sqlite3.Connection,
+    chat_id: str,
+) -> list[tuple[str, ChangelogEntry]]:
+    rows = conn.execute(
+        """
+        SELECT source_id, item_id, item_title, item_version, item_date, item_url, item_is_prerelease
+        FROM summary_queue
+        WHERE chat_id = ?
+        ORDER BY created_at, rowid
+        """,
+        (chat_id,),
+    ).fetchall()
+
+    result: list[tuple[str, ChangelogEntry]] = []
+    for row in rows:
+        result.append(
+            (
+                row["source_id"],
+                ChangelogEntry(
+                    item_id=row["item_id"],
+                    title=row["item_title"],
+                    version=row["item_version"],
+                    date=row["item_date"],
+                    body="",
+                    url=row["item_url"],
+                    is_prerelease=bool(int(row["item_is_prerelease"])) if row["item_is_prerelease"] is not None else False,
+                ),
+            )
+        )
+    return result
+
+
+def clear_summary_queue(conn: sqlite3.Connection, chat_id: str) -> None:
+    conn.execute("DELETE FROM summary_queue WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+
+
+def mark_chat_summary_sent(conn: sqlite3.Connection, chat_id: str, sent_at: datetime) -> None:
+    conn.execute(
+        "UPDATE routing_chats SET last_summary_sent_at = ? WHERE chat_id = ?",
+        (sent_at.isoformat(), chat_id),
     )
     conn.commit()
 
@@ -823,9 +1264,86 @@ def truncate(text: str, limit: int) -> str:
 
 
 def compact_markdown_for_telegram(text: str) -> str:
-    # Keep release notes readable, but avoid huge Markdown artifacts.
+    # Keep release notes readable in Telegram, while preserving content.
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+    # Strip markdown code blocks, keep the content to preserve details.
+    def _code_block(match: re.Match[str]) -> str:
+        body = (match.group(1) or "").strip("\n")
+        if not body:
+            return ""
+        return "\n" + body + "\n"
+
+    text = re.sub(r"```[a-zA-Z0-9_+-]*\n(.*?)\n```", _code_block, text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^```[a-zA-Z0-9_+-]*\s*$", "", text)
+
+    # Convert markdown headings to readable labels, then make them bold-safe for HTML formatting.
+    heading_open = "[[TG-HEADING-BOLD-OPEN]]"
+    heading_close = "[[TG-HEADING-BOLD-CLOSE]]"
+
+    def _heading_to_text(match: re.Match[str]) -> str:
+        level = len(match.group(1))
+        label = match.group(2).strip()
+        if not label:
+            return ""
+        if level <= 2:
+            return f"\n{heading_open}{label}{heading_close}\n"
+        if level == 3:
+            return f"\n{heading_open}— {label}{heading_close}\n"
+        return f"\n{heading_open}◦ {label}{heading_close}\n"
+
+    text = re.sub(r"(?m)^(#{1,6})\s+(.*?)\s*$", _heading_to_text, text)
+
+    # Convert lists and task lists.
+    def _task_list_to_text(match: re.Match[str]) -> str:
+        indent = len(match.group(1))
+        is_done = match.group(2).lower() == "x"
+        item = match.group(3).strip()
+        bullet = "◦ " if indent >= 2 else "• "
+        status = "✅ " if is_done else "☐ "
+        return f"{bullet}{status}{item}"
+
+    text = re.sub(r"(?m)^([ \t]{0,3})[-*+]\s*\[([ xX])\]\s+(.*)$", _task_list_to_text, text)
+    text = re.sub(r"(?m)^[ \t]{4,}(\d+)\.\s+(.*)$", r"    ◦ \1. \2", text)
+    text = re.sub(r"(?m)^[ \t]{4,}[-*+]\s+(.*)$", r"    ◦ \1", text)
+    text = re.sub(r"(?m)^[ \t]*(\d+)\.\s+(.*)$", r"\1. \2", text)
+    text = re.sub(r"(?m)^[ \t]*[-*+]\s+(.*)$", r"• \1", text)
+
+    # Remove quote markers.
+    text = re.sub(r"(?m)^>\s?", "", text)
+
+    # Strip common markdown emphasis/code markers, keep inner text.
+    for pattern in (
+        r"\*\*(.+?)\*\*",
+        r"__(.+?)__",
+        r"\*(.+?)\*",
+        r"_(.+?)_",
+        r"~~(.+?)~~",
+        r"`([^`\n]+)`",
+    ):
+        text = re.sub(pattern, r"\1", text)
+
+    # Convert markdown links to visible text, keep plain URL in a separate place if needed.
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", text)
+
+    # Remove HTML fragments that sometimes appear in release notes.
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:b|strong|i|em|s|strike|u|code|pre|blockquote|a|p|ul|ol|li|br)\b[^>]*>", "", text, flags=re.IGNORECASE)
+
+    # Remove markdown table separators, keep only simple text lines.
+    text = "\n".join(
+        line
+        for line in text.split("\n")
+        if not re.fullmatch(r"\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*", line)
+    )
+
     text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
 
@@ -866,6 +1384,7 @@ def format_message(source: dict[str, Any], entry: ChangelogEntry) -> str:
     date = format_date_with_tz(entry.date) if entry.date else None
     body_raw = compact_markdown_for_telegram(entry.body or "Без описания.")
     body = html.escape(truncate(body_raw, max_body_chars))
+    body = body.replace("[[TG-HEADING-BOLD-OPEN]]", "<b>").replace("[[TG-HEADING-BOLD-CLOSE]]", "</b>")
     url = html.escape(entry.url, quote=True)
 
     prerelease_mark = " <i>pre-release</i>" if entry.is_prerelease else ""
@@ -1096,7 +1615,7 @@ async def run_admin_command_listener(
                                 client,
                                 telegram_token,
                                 reply_chat_id,
-                                "Использование: /subscribe <source_id> [chat_id] или /unsubscribe <source_id> [chat_id]",
+                                "Использование: /subscribe <source_id> [chat_id|alias] или /unsubscribe <source_id> [chat_id|alias]",
                             )
                             continue
 
@@ -1110,10 +1629,16 @@ async def run_admin_command_listener(
                             )
                             continue
 
-                        target_chat_id = normalize_chat_id(
-                            args[1] if len(args) > 1 else reply_chat_id,
-                            "chat_id",
-                        )
+                        target_chat_token = args[1] if len(args) > 1 else reply_chat_id
+                        target_chat_id = resolve_chat_identifier(target_chat_token, routing)
+                        if target_chat_id is None:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Чат {target_chat_token!r} не найден. Укажи chat_id или alias из routing DB.",
+                            )
+                            continue
 
                         if command == "subscribe":
                             result = apply_chat_subscription_change(
@@ -1140,7 +1665,7 @@ async def run_admin_command_listener(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            "Доступные команды: /reload, /subscribe <source_id> [chat_id], /unsubscribe <source_id> [chat_id]",
+                            "Доступные команды: /reload, /subscribe <source_id> [chat_id|alias], /unsubscribe <source_id> [chat_id|alias]",
                         )
                         continue
 
@@ -1226,17 +1751,18 @@ async def send_summary(
     chat_id: str,
     entries: list[tuple[dict[str, Any], ChangelogEntry]],
     dry_run: bool,
-) -> None:
+) -> bool:
     if not entries:
-        return
+        return False
 
     msg = build_aggregate_summary(entries)
     if dry_run:
         LOG.info("[summary] DRY RUN would post aggregate:")
         LOG.info("%s", msg)
-        return
+        return True
 
     await send_telegram_message(client, telegram_token, chat_id, msg)
+    return True
 
 
 async def send_summaries(
@@ -1273,6 +1799,7 @@ async def check_all(
 
     routing = routing_state.get(source_ids, force_reload=force_routing_reload)
     source_to_chat = build_source_to_chat_map(routing_sources, routing)
+    source_lookup = {source["id"]: source for source in routing_sources}
 
     if not routing.chats:
         raise RuntimeError("routing config does not define any chats")
@@ -1285,6 +1812,7 @@ async def check_all(
         raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
 
     summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
+    now = datetime.now(timezone.utc)
     accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
     conn = db_connect(db_path)
@@ -1340,16 +1868,63 @@ async def check_all(
                     chat = routing.chats.get(chat_id)
                     if not chat or not chat.send_summary:
                         continue
-                    summary_items_by_chat[chat_id].extend((source, entry) for entry in posted_entries)
+                    if chat.summary_schedule.mode == "immediate":
+                        summary_items_by_chat[chat_id].extend((source, entry) for entry in posted_entries)
+                    elif not dry_run:
+                        enqueue_summary_items(conn, chat_id, source["id"], posted_entries)
             except Exception:
                 LOG.exception("[%s] failed", source.get("id", "unknown"))
 
-        await send_summaries(
-            client,
-            telegram_token,
-            summary_items_by_chat,
-            dry_run=dry_run,
-        )
+        for chat in routing.chats.values():
+            if not chat.enabled or not chat.send_summary:
+                continue
+            if not dry_run and chat.chat_id not in accessible_chat_ids:
+                continue
+
+            queued = load_summary_queue_items(conn, chat.chat_id)
+            entries_for_chat: list[tuple[dict[str, Any], ChangelogEntry]] = []
+
+            for source_id, entry in queued:
+                source = source_lookup.get(source_id, {"id": source_id})
+                entries_for_chat.append((source, entry))
+
+            if chat.summary_schedule.mode == "immediate":
+                entries_for_chat.extend(summary_items_by_chat.get(chat.chat_id, []))
+                if not entries_for_chat:
+                    continue
+
+                if dry_run:
+                    await send_summary(client, telegram_token, chat.chat_id, entries_for_chat, dry_run=True)
+                else:
+                    try:
+                        sent = await send_summary(
+                            client,
+                            telegram_token,
+                            chat.chat_id,
+                            entries_for_chat,
+                            dry_run=False,
+                        )
+                        if sent:
+                            clear_summary_queue(conn, chat.chat_id)
+                    except Exception:
+                        LOG.exception("failed to send immediate summary to %s", chat.chat_id)
+                continue
+
+            if not entries_for_chat:
+                continue
+
+            if not is_summary_due(chat.summary_schedule, now, chat.last_summary_sent_at):
+                continue
+
+            try:
+                sent = await send_summary(client, telegram_token, chat.chat_id, entries_for_chat, dry_run=dry_run)
+            except Exception:
+                LOG.exception("failed to send summary to %s", chat.chat_id)
+                continue
+
+            if sent and not dry_run:
+                clear_summary_queue(conn, chat.chat_id)
+                mark_chat_summary_sent(conn, chat.chat_id, now)
     conn.close()
 
 

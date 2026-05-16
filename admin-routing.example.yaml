@@ -2,7 +2,8 @@
 # Скопируй в admin-routing.yaml и подставь реальные Telegram ID.
 
 admins:
-  - 12345678
+  - id: 12345678
+    alias: maintainer
 
 source_groups:
   core:
@@ -16,6 +17,7 @@ source_groups:
 
 chats:
   - chat_id: -1001234567890
+    alias: main
     title: Основной канал
     groups:
       - core
@@ -23,11 +25,18 @@ chats:
     sources: []
     enabled: true
     send_summary: true
+    summary_schedule:
+      mode: immediate
 
   - chat_id: -1009876543210
+    alias: backup
     title: Резервный канал
     groups: []
     sources:
       - codenomad_releases
     enabled: true
     send_summary: false
+    summary_schedule:
+      mode: weekly
+      time: "20:00"
+      weekday: monday
