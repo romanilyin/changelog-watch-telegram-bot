@@ -1884,6 +1884,8 @@ async def check_source(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
     source: dict[str, Any],
+    *,
+    dry_run: bool = False,
 ) -> tuple[list[ChangelogEntry], list[ChangelogEntry]]:
     source_id = source["id"]
     entries = await parse_source(client, source)
@@ -1894,8 +1896,9 @@ async def check_source(
     initialized = is_source_initialized(conn, source_id)
 
     if not initialized and not source.get("post_on_first_run", False):
-        mark_many_posted(conn, source_id, entries)
-        mark_source_initialized(conn, source_id)
+        if not dry_run:
+            mark_many_posted(conn, source_id, entries)
+            mark_source_initialized(conn, source_id)
         LOG.info("[%s] initialized with %d existing entries; nothing posted", source_id, len(entries))
         return entries, []
 
@@ -1907,16 +1910,17 @@ async def check_source(
 
     if not new_entries:
         LOG.info("[%s] no new entries", source_id)
-        if not initialized:
+        if not initialized and not dry_run:
             mark_many_posted(conn, source_id, entries)
             mark_source_initialized(conn, source_id)
         return entries, []
 
-    if initialized:
-        mark_many_posted(conn, source_id, new_entries)
-    else:
-        mark_many_posted(conn, source_id, entries)
-        mark_source_initialized(conn, source_id)
+    if not dry_run:
+        if initialized:
+            mark_many_posted(conn, source_id, new_entries)
+        else:
+            mark_many_posted(conn, source_id, entries)
+            mark_source_initialized(conn, source_id)
 
     return entries, new_entries
 
@@ -2033,7 +2037,7 @@ async def check_all(
                         ", ".join(skipped_chat_ids),
                     )
 
-                source_entries, new_entries = await check_source(conn, client, source)
+                source_entries, new_entries = await check_source(conn, client, source, dry_run=dry_run)
                 if not source_entries:
                     continue
 
@@ -2077,7 +2081,6 @@ async def check_all(
                                     chat_id,
                                     msg,
                                 )
-                                mark_delivery_status(conn, source["id"], entry.item_id, chat_id, sent=True)
                                 continue
 
                             try:

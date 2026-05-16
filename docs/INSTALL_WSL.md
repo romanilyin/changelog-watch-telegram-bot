@@ -141,7 +141,7 @@ systemctl --version
 Если systemd работает, можно поставить сервис:
 
 ```bash
-sudo cp systemd/changelog-watch-bot.service /etc/systemd/system/changelog-watch-bot.service
+sudo cp systemd/changelog-watch-bot.service.example /etc/systemd/system/changelog-watch-bot.service
 sudo nano /etc/systemd/system/changelog-watch-bot.service
 ```
 

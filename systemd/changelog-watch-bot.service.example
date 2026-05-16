@@ -1,0 +1,16 @@
+[Unit]
+Description=Changelog Watch Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<CHANGELOG_WATCH_USER>
+WorkingDirectory=<CHANGELOG_WATCH_ROOT>
+EnvironmentFile=<CHANGELOG_WATCH_ROOT>/.env
+ExecStart=<CHANGELOG_WATCH_ROOT>/.venv/bin/python <CHANGELOG_WATCH_ROOT>/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,7 @@ requirements.txt
 .env.example
 docs/INSTALL_WSL.md
 docs/ADMIN_DESIGN.md
-systemd/changelog-watch-bot.service
+systemd/changelog-watch-bot.service.example
 ```
 
 ## Быстрый старт
@@ -80,9 +80,9 @@ chats:
       - core
     sources: []
     send_summary: true
-    delivery_mode: both
+    delivery_mode: instant
     summary_schedule:
-      mode: immediate
+      mode: none
   - chat_id: -1009876543210
     alias: backup
     title: Резервный канал
