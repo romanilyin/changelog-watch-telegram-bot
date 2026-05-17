@@ -212,11 +212,17 @@ resolve_systemd_units_for_repo() {
         fi
 
         local exec_start
+        local active_state
         local match
         local main_pid
 
         exec_start="$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null | tr -d '\r')"
         if [ -z "$exec_start" ]; then
+            continue
+        fi
+
+        active_state="$(systemctl --user show "$unit" --property=ActiveState --value 2>/dev/null | tr -d '\r')"
+        if [ "$active_state" != "active" ] && [ "$active_state" != "activating" ] && [ "$active_state" != "deactivating" ] && [ "$active_state" != "reloading" ]; then
             continue
         fi
 
