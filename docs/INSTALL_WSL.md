@@ -123,6 +123,14 @@ python bot.py
 ./data/restart-changelog-watch-bot.sh        # перезапуск
 ```
 
+Если запуск идёт из Windows PowerShell 7, удобны скрипты-обертки в корне репозитория:
+
+```powershell
+pwsh ./start-changelog-watch-bot.ps1 -Once -DryRun
+pwsh ./restart-changelog-watch-bot.ps1
+pwsh ./stop-changelog-watch-bot.ps1
+```
+
 Аргумент `--once` и `--dry-run` также пробрасывается через `start`/`restart`.
 
 ## 7. Удобный запуск через `tmux`, если нужен долгий тест

@@ -1,0 +1,326 @@
+#requires -Version 7.0
+[CmdletBinding()]
+param(
+    [string]$WslDistro = "",
+
+    [string]$WindowsRepoPath = (Resolve-Path $PSScriptRoot).Path,
+
+    [string[]]$BotArgs = @(),
+
+    [switch]$DryRun,
+
+    [switch]$Once,
+
+    [switch]$Force,
+
+    [switch]$Tail,
+
+    [int]$TailLines = 80
+)
+
+$ErrorActionPreference = "Stop"
+
+function Convert-ToWslPath {
+    param([string]$Path)
+
+    $resolved = [System.IO.Path]::GetFullPath($Path)
+
+    if ($resolved -match "^([A-Za-z]):[\\/](.*)$") {
+        $drive = $matches[1].ToLower()
+        $rest = $matches[2] -replace "\\", "/"
+        return "/mnt/$drive/$rest"
+    }
+
+    return $resolved
+}
+
+function Invoke-WslBot {
+    param([string[]]$Arguments)
+
+    $wslArgs = @()
+    if ($WslDistro) {
+        $wslArgs += @("-d", $WslDistro)
+    }
+
+    $wslArgs += $Arguments
+    & wsl.exe @wslArgs
+    return $LASTEXITCODE
+}
+
+if (-not (Test-Path -LiteralPath $WindowsRepoPath -PathType Container)) {
+    throw "Repo path not found: $WindowsRepoPath"
+}
+
+$repoWslPath = Convert-ToWslPath $WindowsRepoPath
+$tmpBashWindowsPath = Join-Path $WindowsRepoPath ".start-changelog-watch-bot-wsl.tmp.sh"
+$tmpBashWslPath = "$repoWslPath/.start-changelog-watch-bot-wsl.tmp.sh"
+
+$argsToPass = @()
+if ($Once) {
+    $argsToPass += "--once"
+}
+
+if ($DryRun) {
+    $argsToPass += "--dry-run"
+}
+
+$argsToPass += $BotArgs
+
+$forceArg = if ($Force) { "1" } else { "0" }
+
+$bashScript = @'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="${1:?repo path is required}"
+FORCE="${2:-0}"
+shift 2
+
+log() { printf "[bot-start] %s\n" "$*"; }
+warn() { printf "[bot-start] WARN: %s\n" "$*" >&2; }
+fail() { printf "[bot-start] ERROR: %s\n" "$*" >&2; exit 1; }
+
+if [ ! -d "$REPO" ]; then
+    fail "repo not found: $REPO"
+fi
+
+cd "$REPO"
+
+if [ ! -f bot.py ]; then
+    fail "bot.py not found in repo"
+fi
+
+    if [ ! -x .venv/bin/python ]; then
+        fail ".venv/bin/python is missing. Create venv and install requirements first."
+    fi
+
+    mkdir -p data
+    PID_FILE="$REPO/data/bot.pid"
+    LOG_FILE="$REPO/data/bot.log"
+
+    resolve_lock_file() {
+        local env_lock="${BOT_INSTANCE_LOCK_PATH:-}"
+        local env_file="${REPO}/.env"
+        local repo_lock=""
+        local script_abs
+        local lock_suffix
+
+        if [ -n "$env_lock" ]; then
+            printf '%s\n' "$env_lock"
+            return
+        fi
+
+        if [ -f "$env_file" ]; then
+            repo_lock="$(grep -E '^[[:space:]]*BOT_INSTANCE_LOCK_PATH[[:space:]]*=' "$env_file" | tail -n1 | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]' | tr -d '"' | tr -d "'")"
+            if [ -n "$repo_lock" ]; then
+                printf '%s\n' "$repo_lock"
+                return
+            fi
+        fi
+
+        script_abs="$(readlink -f "$REPO/bot.py")"
+        lock_suffix="$(printf '%s' "$script_abs" | sha1sum | awk '{print substr($1, 1, 16)}')"
+        printf '/tmp/changelog-watch-telegram-bot-%s.lock\n' "$lock_suffix"
+    }
+
+    LOCK_FILE="$(resolve_lock_file)"
+
+    read_lock_pid() {
+        local path="$1"
+        local pid
+
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+            return 1
+        fi
+
+        pid="$(sed -n '1p' "$path" 2>/dev/null | tr -d '[:space:]')"
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+
+        return 1
+    }
+
+is_bot_process() {
+    local pid="$1"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    local cmd
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    if [[ "$cmd" != *"bot.py"* ]]; then
+        return 1
+    fi
+
+    local cwd
+    cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    if [ -z "$cwd" ]; then
+        return 1
+    fi
+
+    if [ "$cwd" != "$REPO" ] && [ "${cwd#${REPO}/}" = "$cwd" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+collect_existing_pids() {
+    local -a pids=()
+    local pid
+
+    while read -r pid; do
+        if [ -z "$pid" ]; then
+            continue
+        fi
+
+        if is_bot_process "$pid"; then
+            pids+=("$pid")
+        fi
+    done < <(pgrep -f "bot.py" || true)
+
+    if [ -f "$PID_FILE" ]; then
+        local pid_file
+        pid_file="$(sed -n '1p' "$PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+
+        if [[ "$pid_file" =~ ^[0-9]+$ ]] && is_bot_process "$pid_file"; then
+            pids+=("$pid_file")
+        fi
+    fi
+
+    if [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        lock_pid="$(read_lock_pid "$LOCK_FILE")"
+
+        if [ -n "$lock_pid" ] && is_bot_process "$lock_pid"; then
+            pids+=("$lock_pid")
+        elif [ -n "$lock_pid" ]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+
+    printf '%s\n' "${pids[@]}"
+}
+
+dedupe_pids() {
+    local -A seen=()
+    local -a out=()
+    local pid
+
+    for pid in "$@"; do
+        pid="${pid//[[:space:]]/}"
+
+        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+
+        if [ -n "${seen[$pid]:-}" ]; then
+            continue
+        fi
+
+        seen[$pid]=1
+        out+=("$pid")
+    done
+
+    printf '%s\n' "${out[@]}"
+}
+
+mapfile -t EXISTING_RAW_PIDS < <(collect_existing_pids)
+mapfile -t EXISTING_PIDS < <(dedupe_pids "${EXISTING_RAW_PIDS[@]}")
+
+if [ "${#EXISTING_PIDS[@]}" -gt 0 ]; then
+    if [ "$FORCE" != "1" ]; then
+        fail "bot is already running (pid: ${EXISTING_PIDS[*]}). Use -Force to stop previous instance and start new."
+    fi
+
+    for pid in "${EXISTING_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            warn "stopping existing pid=$pid"
+            kill -TERM "$pid" || true
+        fi
+    done
+
+    for attempt in {1..8}; do
+        all_stopped=true
+        for pid in "${EXISTING_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                all_stopped=false
+                break
+            fi
+        done
+
+        if [ "$all_stopped" = true ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    for pid in "${EXISTING_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" || true
+        fi
+    done
+
+    sleep 1
+fi
+
+cmd=(./.venv/bin/python bot.py)
+if [ "$#" -gt 0 ]; then
+    cmd+=("$@")
+fi
+
+nohup "${cmd[@]}" >>"$LOG_FILE" 2>&1 < /dev/null &
+bot_pid=$!
+disown "$bot_pid" 2>/dev/null || true
+
+sleep 1
+if ! kill -0 "$bot_pid" 2>/dev/null; then
+    fail "failed to start bot, see $LOG_FILE"
+fi
+
+printf '%s\n' "$bot_pid" > "$PID_FILE"
+log "started bot pid=$bot_pid"
+log "log file: $LOG_FILE"
+printf "%s\n" "$bot_pid"
+'@
+
+try {
+    [System.IO.File]::WriteAllText($tmpBashWindowsPath, $bashScript, [System.Text.UTF8Encoding]::new($false))
+
+    $wslCmd = @(
+        "--",
+        "bash",
+        "$tmpBashWslPath",
+        "$repoWslPath",
+        $forceArg
+    )
+
+    if ($argsToPass.Count -gt 0) {
+        $wslCmd += $argsToPass
+    }
+
+    Invoke-WslBot -Arguments $wslCmd
+}
+finally {
+    if (Test-Path -LiteralPath $tmpBashWindowsPath) {
+        Remove-Item -LiteralPath $tmpBashWindowsPath -Force
+    }
+}
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to start bot. WSL exit code: $LASTEXITCODE"
+}
+
+if ($Tail) {
+    Write-Host "Showing last $TailLines log lines from $WindowsRepoPath\data\bot.log" -ForegroundColor Green
+    wsl.exe @(
+        $(if ($WslDistro) { @("-d", $WslDistro) } else { @() }),
+        "--",
+        "bash",
+        "-lc",
+        "cd '$repoWslPath'; tail -n $TailLines data/bot.log"
+    ) | Write-Host
+}

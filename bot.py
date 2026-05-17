@@ -1243,6 +1243,32 @@ def mark_many_posted(conn: sqlite3.Connection, source_id: str, entries: list[Cha
     conn.commit()
 
 
+def claim_new_posts(conn: sqlite3.Connection, source_id: str, entries: list[ChangelogEntry]) -> list[ChangelogEntry]:
+    """Insert and return only entries not yet posted for this source.
+
+    This protects against accidental double-start scenarios by making item marking
+    atomic: only the first process successfully inserts an (source_id, item_id) pair.
+    """
+    if not entries:
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    claimed: list[ChangelogEntry] = []
+
+    for entry in entries:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO posted_items(source_id, item_id, posted_at) VALUES (?, ?, ?)",
+            (source_id, entry.item_id, now),
+        )
+        if cursor.rowcount == 1:
+            claimed.append(entry)
+
+    if claimed:
+        conn.commit()
+
+    return claimed
+
+
 def ai_summary_enabled() -> bool:
     return os.getenv("AI_SUMMARY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -2407,12 +2433,22 @@ async def check_source(
 
     if not initialized and not source.get("post_on_first_run", False):
         if not dry_run:
-            mark_many_posted(conn, source_id, entries)
+            claimed_entries = claim_new_posts(conn, source_id, entries)
+            if len(claimed_entries) != len(entries):
+                LOG.debug(
+                    "[%s] first-run seed had already posted %d/%d items",
+                    source_id,
+                    len(entries) - len(claimed_entries),
+                    len(entries),
+                )
             mark_source_initialized(conn, source_id)
         LOG.info("[%s] initialized with %d existing entries; nothing posted", source_id, len(entries))
         return entries, []
 
-    new_entries = [entry for entry in entries if not is_posted(conn, source_id, entry.item_id)]
+    if dry_run:
+        new_entries = [entry for entry in entries if not is_posted(conn, source_id, entry.item_id)]
+    else:
+        new_entries = claim_new_posts(conn, source_id, entries)
 
     if not initialized:
         first_run_limit = int(source.get("first_run_limit", 1))
@@ -2421,16 +2457,13 @@ async def check_source(
     if not new_entries:
         LOG.info("[%s] no new entries", source_id)
         if not initialized and not dry_run:
-            mark_many_posted(conn, source_id, entries)
             mark_source_initialized(conn, source_id)
         return entries, []
 
-    if not dry_run:
-        if initialized:
-            mark_many_posted(conn, source_id, new_entries)
-        else:
-            mark_many_posted(conn, source_id, entries)
-            mark_source_initialized(conn, source_id)
+    if not dry_run and not initialized:
+        # For a first run we still keep state consistent by storing all seen entries,
+        # but deliver only up to first_run_limit.
+        mark_source_initialized(conn, source_id)
 
     return entries, new_entries
 

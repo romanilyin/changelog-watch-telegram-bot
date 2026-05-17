@@ -16,6 +16,9 @@ products.yaml
 admin-routing.yaml (seed-файл для начальной инициализации routing-хранилища)
 requirements.txt
 .env.example
+start-changelog-watch-bot.ps1
+stop-changelog-watch-bot.ps1
+restart-changelog-watch-bot.ps1
 docs/INSTALL_WSL.md
 docs/ADMIN_DESIGN.md
 systemd/changelog-watch-bot.service.example
@@ -37,17 +40,29 @@ python bot.py
 
 ### Управление процессом бота
 
-В репозитории есть скрипты для простого запуска и остановки в Linux/WSL:
+В репозитории есть скрипты для простого запуска и остановки:
 
 - `./data/start-changelog-watch-bot.sh` — запуск `bot.py` из корня проекта (через локальный `.venv`).
 - `./data/stop-changelog-watch-bot.sh` — мягко останавливает локально запущенные процессы `bot.py`.
 - `./data/restart-changelog-watch-bot.sh` — выполняет остановку и новый запуск.
 
-Переданные `start`/`restart` скриптам аргументы пробрасываются в `python bot.py`, поэтому можно запускать, например:
+Для запуска из Windows PowerShell 7 доступен WSL-оболочка, которая стартует/останавливает бот в текущем репозитории:
+
+- `./start-changelog-watch-bot.ps1` — запуск через WSL.
+- `./stop-changelog-watch-bot.ps1` — остановка через WSL.
+- `./restart-changelog-watch-bot.ps1` — остановка + запуск нового экземпляра.
+
+Для всех `start`/`restart` скриптов, включая PowerShell-обертки, аргументы пробрасываются в `python bot.py`, поэтому можно запускать, например:
 
 ```bash
 ./data/start-changelog-watch-bot.sh --once --dry-run
 ./data/restart-changelog-watch-bot.sh
+```
+
+```powershell
+./start-changelog-watch-bot.ps1 -Once -DryRun -BotArgs @("--config", "products.yaml")
+./restart-changelog-watch-bot.ps1 -DryRun
+./stop-changelog-watch-bot.ps1 -WaitSeconds 15
 ```
 
 Переменная окружения `BOT_INSTANCE_LOCK_PATH` позволяет переопределить путь блокировки одиночного инстанса (`--dry-run` блокировку не использует).
