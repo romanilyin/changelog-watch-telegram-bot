@@ -35,6 +35,76 @@ python bot.py --once
 python bot.py
 ```
 
+### Управление процессом бота
+
+В репозитории есть скрипты для простого запуска и остановки в Linux/WSL:
+
+- `./data/start-changelog-watch-bot.sh` — запуск `bot.py` из корня проекта (через локальный `.venv`).
+- `./data/stop-changelog-watch-bot.sh` — мягко останавливает локально запущенные процессы `bot.py`.
+- `./data/restart-changelog-watch-bot.sh` — выполняет остановку и новый запуск.
+
+Переданные `start`/`restart` скриптам аргументы пробрасываются в `python bot.py`, поэтому можно запускать, например:
+
+```bash
+./data/start-changelog-watch-bot.sh --once --dry-run
+./data/restart-changelog-watch-bot.sh
+```
+
+Переменная окружения `BOT_INSTANCE_LOCK_PATH` позволяет переопределить путь блокировки одиночного инстанса (`--dry-run` блокировку не использует).
+
+### systemd (production)
+
+Для автозапуска можно использовать `systemd/changelog-watch-bot.service.example`:
+
+```bash
+sudo cp systemd/changelog-watch-bot.service.example /etc/systemd/system/changelog-watch-bot.service
+sudo nano /etc/systemd/system/changelog-watch-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable changelog-watch-bot
+sudo systemctl restart changelog-watch-bot
+sudo journalctl -u changelog-watch-bot -f
+```
+
+В сервисе уже можно задать `BOT_INSTANCE_LOCK_PATH` (через `Environment`) для контроля файла lock.
+
+### Диагностика single-instance lock
+
+Если видишь сообщение `single-instance lock is already held`, сначала проверь, действительно ли процесс еще жив:
+
+```bash
+ps -ef | grep '/changelog-watch-telegram-bot/bot.py' | grep -v grep
+```
+
+Если процессов нет, но есть ложный конфликт, удали lock-файл после полной остановки процесса:
+
+```bash
+python - <<'PY'
+import hashlib
+from pathlib import Path
+
+bot = Path('bot.py').resolve()
+suffix = hashlib.sha1(bot.as_posix().encode('utf-8')).hexdigest()[:16]
+print(f"/tmp/changelog-watch-telegram-bot-{suffix}.lock")
+PY
+rm -f /tmp/changelog-watch-telegram-bot-*.lock
+if [ -n "${BOT_INSTANCE_LOCK_PATH:-}" ]; then
+  rm -f "$BOT_INSTANCE_LOCK_PATH"
+fi
+```
+
+`$BOT_INSTANCE_LOCK_PATH` можно задать вручную в `.env` или в `systemd` и тогда очистка будет точечной:
+
+```bash
+if [ -n "${BOT_INSTANCE_LOCK_PATH:-}" ]; then
+  rm -f "$BOT_INSTANCE_LOCK_PATH"
+fi
+```
+
+Полезно при отладке singleton:
+
+- Проверка запущенных инстансов: `ps -ef | grep '/changelog-watch-telegram-bot/bot.py' | grep -v grep`.
+- `dry-run` не использует блокировку, поэтому для диагностики конфликта всегда запускай без `--dry-run`.
+
 Основные переменные окружения:
 
 - `DISPLAY_TIMEZONE` — часовой пояс для отображения времени релизов GitHub (по умолчанию `Europe/Amsterdam`).
@@ -73,7 +143,7 @@ python bot.py
 
 ### AI one-line summary (необязательно)
 
-- При `AI_SUMMARY_ENABLED=true` бот генерирует короткую строку `<b>Кратко:</b> ...` для instant-сообщений.
+- При `AI_SUMMARY_ENABLED=true` бот генерирует короткую строку `<b>Кратко:</b> ...` для instant-сообщений и для записей в сводках.
 - Результат кэшируется в SQLite таблице `ai_summaries` по комбинации `source_id + item_id + model + target_language`.
 - Если OpenCode Zen не отвечает или ключ не задан, бот отправляет обычное сообщение без ошибок и продолжает работу.
 - В `--dry-run` кэш не записывается (чтение из `ai_summaries` разрешено, запись запрещена).

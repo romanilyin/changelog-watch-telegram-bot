@@ -14,9 +14,12 @@ import argparse
 import asyncio
 import html
 import logging
+import errno
+import hashlib
 import os
 import re
 import signal
+import tempfile
 from collections import defaultdict
 import sqlite3
 from dataclasses import dataclass, field
@@ -31,6 +34,7 @@ import httpx
 import yaml
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import fcntl
 
 LOG = logging.getLogger("changelog-watch-bot")
 
@@ -75,6 +79,134 @@ WEEKDAY_NAMES = {
 DEFAULT_DISPLAY_TIMEZONE = "Europe/Amsterdam"
 _display_tz_name = DEFAULT_DISPLAY_TIMEZONE
 _display_tz = ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+_duplicate_instances_alert_sent = False
+_single_instance_lock_fd: int | None = None
+_single_instance_lock_path: Path | None = None
+
+
+def default_single_instance_lock_path() -> Path:
+    script_path = Path(__file__).resolve()
+    lock_suffix = hashlib.sha1(script_path.as_posix().encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"changelog-watch-telegram-bot-{lock_suffix}.lock"
+
+
+def read_single_instance_lock_pid(lock_path: Path) -> int | None:
+    try:
+        content = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    if not content:
+        return None
+
+    first_line = content.splitlines()[0].strip()
+    try:
+        return int(first_line)
+    except ValueError:
+        return None
+
+
+def acquire_single_instance_lock(lock_path: str | None = None) -> tuple[bool, int | None]:
+    global _single_instance_lock_fd, _single_instance_lock_path
+
+    if _single_instance_lock_fd is not None:
+        return True, os.getpid()
+
+    path = Path(lock_path) if lock_path else default_single_instance_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(lock_fd)
+        if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+            return False, read_single_instance_lock_pid(path)
+        raise
+
+    _single_instance_lock_fd = lock_fd
+    _single_instance_lock_path = path
+    os.ftruncate(lock_fd, 0)
+    os.lseek(lock_fd, 0, os.SEEK_SET)
+    os.write(lock_fd, f"{os.getpid()}\n".encode("utf-8"))
+    os.fsync(lock_fd)
+    return True, os.getpid()
+
+
+def release_single_instance_lock() -> None:
+    global _single_instance_lock_fd, _single_instance_lock_path
+
+    if _single_instance_lock_fd is None:
+        return
+
+    lock_path = _single_instance_lock_path
+    try:
+        fcntl.flock(_single_instance_lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        LOG.debug("failed to unlock single-instance lock file")
+
+    try:
+        os.close(_single_instance_lock_fd)
+    except OSError:
+        LOG.debug("failed to close single-instance lock fd")
+    _single_instance_lock_fd = None
+
+    if lock_path is not None and lock_path.exists():
+        try:
+            lock_path.unlink()
+        except OSError:
+            LOG.debug("failed to remove single-instance lock file")
+    _single_instance_lock_path = None
+
+
+def load_admin_ids_for_lock_alert(routing_config_path: str | None) -> set[str]:
+    path = routing_config_path or os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+    try:
+        routing_data = load_routing_yaml(path)
+    except Exception:
+        LOG.debug("failed to load routing config for lock alert", exc_info=True)
+        return set()
+
+    raw_admins = routing_data.get("admins", [])
+    if not isinstance(raw_admins, list):
+        return set()
+
+    admins: set[str] = set()
+    for idx, raw_admin in enumerate(raw_admins, start=1):
+        try:
+            admin_id, _ = parse_admin_entry(raw_admin, idx)
+        except Exception:
+            LOG.debug("invalid admin entry in routing config at index %d", idx, exc_info=True)
+            continue
+        admins.add(admin_id)
+    return admins
+
+
+async def notify_single_instance_lock_conflict(
+    telegram_token: str,
+    routing_config_path: str,
+    lock_owner_pid: int | None,
+) -> None:
+    admin_ids = load_admin_ids_for_lock_alert(routing_config_path)
+    if not telegram_token or not admin_ids:
+        return
+
+    headers = {
+        "User-Agent": "changelog-watch-telegram-bot/1.0",
+        "Accept": "application/json",
+    }
+    lock_owner = str(lock_owner_pid) if lock_owner_pid else "неизвестен"
+    message = (
+        "⚠️ Обнаружен запуск второго экземпляра changelog-watch-telegram-bot."
+        f" Уже активный процесс: pid={lock_owner}."
+    )
+
+    async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+        for admin_id in sorted(admin_ids):
+            try:
+                await send_telegram_message(client, telegram_token, admin_id, message)
+            except Exception:
+                LOG.exception("failed to notify admin %s about running instance conflict", admin_id)
 
 
 @dataclass(frozen=True)
@@ -1847,23 +1979,43 @@ def format_message_with_ai_summary(
     return "\n".join(lines)
 
 
-def format_summary_entry(source: dict[str, Any], entry: ChangelogEntry) -> str:
+def format_summary_entry(
+    source: dict[str, Any],
+    entry: ChangelogEntry,
+    ai_summary: str | None = None,
+) -> str:
     product = html.escape(str(source.get("product") or source["id"]))
     version = html.escape(entry.version)
     date = html.escape(format_date_with_tz(entry.date)) if entry.date else "не указана"
     url = html.escape(entry.url, quote=True)
-    return (
-        f"🔹 <b>{product}</b> · <code>{version}</code>\n"
-        f"<b>Дата:</b> {date}\n"
-        f"<a href=\"{url}\">Открыть</a>"
-    )
+    lines: list[str] = [
+        f"🔹 <b>{product}</b> · <code>{version}</code>",
+        f"<b>Дата:</b> {date}",
+    ]
+    if ai_summary:
+        lines.append(f"<b>Кратко:</b> {html.escape(ai_summary)}")
+    lines.append(f"<a href=\"{url}\">Открыть</a>")
+    return "\n".join(lines)
 
 
-def build_aggregate_summary(entries: list[tuple[dict[str, Any], ChangelogEntry]]) -> str:
+async def build_aggregate_summary(
+    conn: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    entries: list[tuple[dict[str, Any], ChangelogEntry]],
+    *,
+    dry_run: bool,
+) -> str:
     lines: list[str] = ["📌 <b>Сводка новых релизов</b>"]
     for source, entry in entries:
+        ai_summary = await get_or_generate_ai_summary(
+            conn,
+            client,
+            source,
+            entry,
+            dry_run=dry_run,
+        )
         lines.append("")
-        lines.append(format_summary_entry(source, entry))
+        lines.append(format_summary_entry(source, entry, ai_summary))
     return "\n".join(lines)
 
 
@@ -2146,6 +2298,98 @@ async def run_admin_command_listener(
                 await asyncio.sleep(5)
 
 
+def list_running_bot_pids() -> list[int]:
+    project_root = Path(__file__).resolve().parent
+    project_path_marker = str(project_root)
+    pids: set[int] = set()
+
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+
+        try:
+            with open(entry / "cmdline", "rb") as f:
+                raw_cmd = f.read()
+            if not raw_cmd:
+                continue
+            args = [part for part in raw_cmd.split(b"\x00") if part]
+            if not args:
+                continue
+        except OSError:
+            continue
+
+        has_bot_script = any(part.endswith(b"bot.py") for part in args)
+        if not has_bot_script:
+            continue
+
+        try:
+            cwd = Path(os.readlink(entry / "cwd")).resolve()
+        except OSError:
+            continue
+
+        if project_path_marker not in str(cwd):
+            continue
+
+        has_repo_script = False
+        for part in args:
+            if b"changelog-watch-telegram-bot" in part:
+                has_repo_script = True
+                break
+            if part in {b"bot.py"}:
+                has_repo_script = True
+                break
+
+        if not has_repo_script:
+            continue
+
+        pids.add(pid)
+
+    return sorted(pids)
+
+
+async def notify_if_multiple_instances(
+    client: httpx.AsyncClient,
+    telegram_token: str,
+    admin_ids: set[str],
+) -> None:
+    global _duplicate_instances_alert_sent
+    if not telegram_token or not admin_ids or _duplicate_instances_alert_sent:
+        return
+
+    pids = list_running_bot_pids()
+    if len(pids) <= 1:
+        return
+
+    current_pid = os.getpid()
+    if current_pid not in pids:
+        return
+
+    if current_pid != min(pids):
+        return
+
+    message = (
+        "⚠️ Обнаружено несколько запущенных экземпляров changelog-watch-telegram-bot. "
+        f"Сейчас запущено: {len(pids)} (pid: {', '.join(map(str, pids))})."
+    )
+
+    for admin_id in sorted(admin_ids):
+        try:
+            await send_telegram_message(client, telegram_token, admin_id, message)
+        except Exception:
+            LOG.exception("failed to notify admin %s about duplicate bot processes", admin_id)
+
+    _duplicate_instances_alert_sent = True
+
+
 async def check_source(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
@@ -2196,12 +2440,13 @@ async def send_summary(
     telegram_token: str,
     chat_id: str,
     entries: list[tuple[dict[str, Any], ChangelogEntry]],
+    conn: sqlite3.Connection,
     dry_run: bool,
 ) -> bool:
     if not entries:
         return False
 
-    msg = build_aggregate_summary(entries)
+    msg = await build_aggregate_summary(conn, client, entries, dry_run=dry_run)
     if dry_run:
         LOG.info("[summary] DRY RUN would post aggregate:")
         LOG.info("%s", msg)
@@ -2215,12 +2460,13 @@ async def send_summaries(
     client: httpx.AsyncClient,
     telegram_token: str,
     entries_by_chat: dict[str, list[tuple[dict[str, Any], ChangelogEntry]]],
+    conn: sqlite3.Connection,
     dry_run: bool,
 ) -> None:
     if not entries_by_chat:
         return
     for chat_id, entries in entries_by_chat.items():
-        await send_summary(client, telegram_token, chat_id, entries, dry_run)
+        await send_summary(client, telegram_token, chat_id, entries, conn, dry_run)
 
 
 async def check_all(
@@ -2268,6 +2514,9 @@ async def check_all(
         "Accept": "text/html,text/markdown,text/plain,application/json,*/*",
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+        if not dry_run:
+            await notify_if_multiple_instances(client, telegram_token, routing.admins)
+
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
 
@@ -2394,6 +2643,7 @@ async def check_all(
                             telegram_token,
                             chat.chat_id,
                             entries_for_chat,
+                            conn,
                             dry_run=dry_run,
                         )
                     except Exception:
@@ -2546,11 +2796,38 @@ def main() -> None:
     load_dotenv()
     setup_logging()
     args = parse_args()
+    lock_path = os.getenv("BOT_INSTANCE_LOCK_PATH")
+    lock_held = False
 
-    if args.once:
-        asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run))
-    else:
-        asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run))
+    if not args.dry_run:
+        lock_acquired, lock_owner_pid = acquire_single_instance_lock(lock_path)
+        if not lock_acquired:
+            message_owner = str(lock_owner_pid) if lock_owner_pid else "неизвестен"
+            LOG.error("single-instance lock is already held; another bot instance is running (pid=%s)", message_owner)
+            try:
+                telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+                routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+                if telegram_token:
+                    asyncio.run(
+                        notify_single_instance_lock_conflict(
+                            telegram_token=telegram_token,
+                            routing_config_path=routing_config_path,
+                            lock_owner_pid=lock_owner_pid,
+                        )
+                    )
+            except Exception:
+                LOG.exception("failed to notify admins about duplicate instance launch")
+            return
+        lock_held = True
+
+    try:
+        if args.once:
+            asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run))
+        else:
+            asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run))
+    finally:
+        if lock_held:
+            release_single_instance_lock()
 
 
 if __name__ == "__main__":

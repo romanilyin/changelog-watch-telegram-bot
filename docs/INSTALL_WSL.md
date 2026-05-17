@@ -58,6 +58,9 @@ TELEGRAM_BOT_TOKEN=токен_от_BotFather
 DB_PATH=data/posted.sqlite3
 ROUTING_CONFIG_PATH=admin-routing.yaml
 # ROUTING_CONFIG_PATH используется как seed для первого импорта в БД.
+# Опционально: явный путь к lock-файлу singleton.
+# Если пусто, путь берется автоматически на основе абсолютного пути bot.py.
+BOT_INSTANCE_LOCK_PATH=
 ROUTING_RELOAD_TTL_SECONDS=0
 ADMIN_POLL_TIMEOUT=25
 ADMIN_COMMAND_POLL_SECONDS=2
@@ -112,6 +115,16 @@ python bot.py
 
 Оставь окно WSL открытым. Бот будет проверять источники раз в 30 минут.
 
+Можно запускать через скрипты управления из `data/`, которые берут виртуальное окружение и корень проекта автоматически:
+
+```bash
+./data/start-changelog-watch-bot.sh          # запуск в консоли
+./data/stop-changelog-watch-bot.sh           # корректная остановка
+./data/restart-changelog-watch-bot.sh        # перезапуск
+```
+
+Аргумент `--once` и `--dry-run` также пробрасывается через `start`/`restart`.
+
 ## 7. Удобный запуск через `tmux`, если нужен долгий тест
 
 ```bash
@@ -138,7 +151,7 @@ tmux attach -t changelog-bot
 systemctl --version
 ```
 
-Если systemd работает, можно поставить сервис:
+Если systemd работает, можно поставить сервис. В `systemd/changelog-watch-bot.service.example` уже есть типовой `ExecStart` и готовый `BOT_INSTANCE_LOCK_PATH` (проверь путь под свой корень):
 
 ```bash
 sudo cp systemd/changelog-watch-bot.service.example /etc/systemd/system/changelog-watch-bot.service
@@ -146,6 +159,7 @@ sudo nano /etc/systemd/system/changelog-watch-bot.service
 ```
 
 Поменяй `User`, `WorkingDirectory` и пути под свой WSL-пользователь.
+Если хочешь хранить lock вне `/tmp`, задай `BOT_INSTANCE_LOCK_PATH` в `.env` или оставь значение из шаблона.
 
 Затем:
 
@@ -155,6 +169,28 @@ sudo systemctl enable changelog-watch-bot
 sudo systemctl start changelog-watch-bot
 sudo journalctl -u changelog-watch-bot -f
 ```
+
+### Диагностика `BOT_INSTANCE_LOCK_PATH`
+
+Если в логе попался конфликт `single-instance lock is already held`, проверьте:
+
+```bash
+ps -eo pid,args | grep '/changelog-watch-telegram-bot/bot.py' | grep -v grep
+```
+
+Если старый процесс уже завершен, а конфликт продолжает появляться, можно удалить lock-файл:
+
+```bash
+source .env
+if [ -n "${BOT_INSTANCE_LOCK_PATH:-}" ]; then
+  rm -f "$BOT_INSTANCE_LOCK_PATH"
+fi
+
+# если переменная не задавалась в .env
+rm -f /tmp/changelog-watch-telegram-bot-*.lock
+```
+
+`--dry-run` блокировку не использует, поэтому для проверки конфликтов запускай обычный `python bot.py --once`.
 
 ## 9. Перенос на рабочий сервер позже
 

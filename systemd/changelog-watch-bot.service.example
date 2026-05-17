@@ -8,6 +8,7 @@ Type=simple
 User=<CHANGELOG_WATCH_USER>
 WorkingDirectory=<CHANGELOG_WATCH_ROOT>
 EnvironmentFile=<CHANGELOG_WATCH_ROOT>/.env
+Environment="BOT_INSTANCE_LOCK_PATH=<CHANGELOG_WATCH_ROOT>/data/changelog-watch-telegram-bot.lock"
 ExecStart=<CHANGELOG_WATCH_ROOT>/.venv/bin/python <CHANGELOG_WATCH_ROOT>/bot.py
 Restart=always
 RestartSec=10
