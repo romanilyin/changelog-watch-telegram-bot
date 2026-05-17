@@ -129,6 +129,9 @@ python bot.py
 pwsh ./start-changelog-watch-bot.ps1 -Once -DryRun
 pwsh ./restart-changelog-watch-bot.ps1
 pwsh ./stop-changelog-watch-bot.ps1
+pwsh ./stop-changelog-watch-bot.ps1  # автоопределение systemd-юнита по bot.py
+pwsh ./stop-changelog-watch-bot.ps1 -SystemdServiceName changelog-watch-bot.service
+pwsh ./status-changelog-watch-bot.ps1 -Tail
 ```
 
 Аргумент `--once` и `--dry-run` также пробрасывается через `start`/`restart`.

@@ -82,6 +82,7 @@ _display_tz = ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
 _duplicate_instances_alert_sent = False
 _single_instance_lock_fd: int | None = None
 _single_instance_lock_path: Path | None = None
+_DUPLICATE_INSTANCE_ALERT_COOLDOWN_SECONDS = 60
 
 
 def default_single_instance_lock_path() -> Path:
@@ -182,10 +183,44 @@ def load_admin_ids_for_lock_alert(routing_config_path: str | None) -> set[str]:
     return admins
 
 
+def _instance_alert_state_file(kind: str, lock_path: str | None = None) -> Path:
+    base_path = Path(lock_path) if lock_path else default_single_instance_lock_path()
+    return base_path.parent / f"{base_path.name}.{kind}.alert"
+
+
+def _should_send_alert_with_cooldown(state_file: Path, marker: str, *, cooldown_seconds: int) -> bool:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    try:
+        raw = state_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+
+    if raw:
+        parts = raw.split(maxsplit=1)
+        if len(parts) == 2:
+            prev_marker, prev_ts_raw = parts
+            try:
+                prev_ts = int(prev_ts_raw)
+            except ValueError:
+                prev_ts = 0
+            if prev_marker == marker and now_ts - prev_ts < cooldown_seconds:
+                return False
+
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(f"{marker} {now_ts}", encoding="utf-8")
+    except OSError:
+        LOG.debug("failed to persist duplicate-instance alert cooldown state at %s", state_file)
+
+    return True
+
+
 async def notify_single_instance_lock_conflict(
     telegram_token: str,
     routing_config_path: str,
     lock_owner_pid: int | None,
+    lock_path: str | None = None,
 ) -> None:
     admin_ids = load_admin_ids_for_lock_alert(routing_config_path)
     if not telegram_token or not admin_ids:
@@ -201,12 +236,65 @@ async def notify_single_instance_lock_conflict(
         f" Уже активный процесс: pid={lock_owner}."
     )
 
+    state_file = _instance_alert_state_file("lock-conflict", lock_path)
+    marker = str(lock_owner)
+    if not _should_send_alert_with_cooldown(state_file, marker=marker, cooldown_seconds=_DUPLICATE_INSTANCE_ALERT_COOLDOWN_SECONDS):
+        return
+
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
         for admin_id in sorted(admin_ids):
             try:
                 await send_telegram_message(client, telegram_token, admin_id, message)
             except Exception:
                 LOG.exception("failed to notify admin %s about running instance conflict", admin_id)
+
+
+def _load_admin_ids_from_env() -> set[str]:
+    raw_admin_ids = os.getenv("ADMIN_IDS", "")
+    admin_ids: set[str] = set()
+    if not raw_admin_ids:
+        return admin_ids
+
+    for raw_admin_id in re.split(r"[\s,]+", raw_admin_ids.strip()):
+        if not raw_admin_id:
+            continue
+
+        try:
+            admin_ids.add(normalize_chat_id(raw_admin_id, "ADMIN_IDS"))
+        except ValueError:
+            LOG.warning("invalid ADMIN_IDS value %r", raw_admin_id)
+
+    return admin_ids
+
+
+def load_admin_ids_for_notifications(routing_config_path: str | None) -> set[str]:
+    admin_ids = _load_admin_ids_from_env()
+    if admin_ids:
+        return admin_ids
+
+    return load_admin_ids_for_lock_alert(routing_config_path)
+
+
+async def notify_admin_lifecycle_event(
+    telegram_token: str,
+    routing_config_path: str | None,
+    message: str,
+) -> None:
+    admin_ids = load_admin_ids_for_notifications(routing_config_path)
+    if not telegram_token or not admin_ids:
+        return
+
+    headers = {
+        "User-Agent": "changelog-watch-telegram-bot/1.0",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+        for admin_id in sorted(admin_ids):
+            try:
+                await send_telegram_message(client, telegram_token, admin_id, message)
+            except Exception:
+                LOG.exception("failed to notify admin %s about bot lifecycle event", admin_id)
 
 
 @dataclass(frozen=True)
@@ -722,7 +810,7 @@ def is_summary_due(schedule: SummarySchedule, now: datetime, last_sent_at: str |
             scheduled_dt -= timedelta(days=1)
 
         if not last_sent_at:
-            return True
+            return now >= scheduled_dt
         last_sent_dt = parse_sqlite_datetime(last_sent_at)
         if last_sent_dt is None:
             return True
@@ -2386,6 +2474,7 @@ async def notify_if_multiple_instances(
     client: httpx.AsyncClient,
     telegram_token: str,
     admin_ids: set[str],
+    lock_path: str | None = None,
 ) -> None:
     global _duplicate_instances_alert_sent
     if not telegram_token or not admin_ids or _duplicate_instances_alert_sent:
@@ -2400,6 +2489,15 @@ async def notify_if_multiple_instances(
         return
 
     if current_pid != min(pids):
+        return
+
+    state_file = _instance_alert_state_file("multiple-instances", lock_path)
+    marker = ",".join(map(str, pids))
+    if not _should_send_alert_with_cooldown(
+        state_file,
+        marker=marker,
+        cooldown_seconds=_DUPLICATE_INSTANCE_ALERT_COOLDOWN_SECONDS,
+    ):
         return
 
     message = (
@@ -2508,6 +2606,7 @@ async def check_all(
     dry_run: bool = False,
     routing_state: RoutingState | None = None,
     force_routing_reload: bool = False,
+    lock_path: str | None = None,
 ) -> None:
     load_dotenv()
     config = load_config(config_path)
@@ -2548,7 +2647,7 @@ async def check_all(
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
         if not dry_run:
-            await notify_if_multiple_instances(client, telegram_token, routing.admins)
+            await notify_if_multiple_instances(client, telegram_token, routing.admins, lock_path=lock_path)
 
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
@@ -2740,7 +2839,7 @@ async def check_all(
     conn.close()
 
 
-async def run_scheduler(config_path: str, db_path: str, dry_run: bool) -> None:
+async def run_scheduler(config_path: str, db_path: str, dry_run: bool, lock_path: str | None = None) -> None:
     config = load_config(config_path)
     poll_minutes = int(config.get("poll_minutes", 30))
     poll_seconds = max(1, poll_minutes * 60)
@@ -2757,18 +2856,29 @@ async def run_scheduler(config_path: str, db_path: str, dry_run: bool) -> None:
 
     loop = asyncio.get_running_loop()
     reload_requested = asyncio.Event()
+    shutdown_requested = asyncio.Event()
 
     def _request_routing_reload() -> None:
         if not reload_requested.is_set():
             LOG.info("received hot-reload signal, forcing routing state reload")
             reload_requested.set()
 
-    for sig_name in ("SIGHUP", "SIGUSR1"):
+    def _request_scheduler_shutdown() -> None:
+        if not shutdown_requested.is_set():
+            LOG.info("received termination signal, stopping scheduler loop")
+            shutdown_requested.set()
+
+    for sig_name, handler in (
+        ("SIGHUP", _request_routing_reload),
+        ("SIGUSR1", _request_routing_reload),
+        ("SIGINT", _request_scheduler_shutdown),
+        ("SIGTERM", _request_scheduler_shutdown),
+    ):
         sig = getattr(signal, sig_name, None)
         if sig is None:
             continue
         try:
-            loop.add_signal_handler(sig, _request_routing_reload)
+            loop.add_signal_handler(sig, handler)
         except (RuntimeError, OSError):
             LOG.debug("signal handler for %s is not supported", sig_name)
 
@@ -2799,14 +2909,27 @@ async def run_scheduler(config_path: str, db_path: str, dry_run: bool) -> None:
                     dry_run=dry_run,
                     routing_state=routing_state,
                     force_routing_reload=force,
+                    lock_path=lock_path,
                 )
             except Exception:
                 LOG.exception("cycle failed")
 
-            try:
-                await asyncio.wait_for(reload_requested.wait(), timeout=poll_seconds)
-            except asyncio.TimeoutError:
-                pass
+            if shutdown_requested.is_set():
+                break
+
+            deadline = monotonic() + poll_seconds
+            while monotonic() < deadline:
+                if shutdown_requested.is_set() or reload_requested.is_set():
+                    break
+
+                wait_timeout = min(1.0, deadline - monotonic())
+                try:
+                    await asyncio.wait_for(reload_requested.wait(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    continue
+
+            if shutdown_requested.is_set():
+                break
     finally:
         if admin_command_task is not None:
             admin_command_task.cancel()
@@ -2831,6 +2954,11 @@ def main() -> None:
     args = parse_args()
     lock_path = os.getenv("BOT_INSTANCE_LOCK_PATH")
     lock_held = False
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+    lifecycle_notifications_enabled = False
+    startup_at = datetime.now(timezone.utc)
+    lifecycle_error: BaseException | None = None
 
     if not args.dry_run:
         lock_acquired, lock_owner_pid = acquire_single_instance_lock(lock_path)
@@ -2846,6 +2974,7 @@ def main() -> None:
                             telegram_token=telegram_token,
                             routing_config_path=routing_config_path,
                             lock_owner_pid=lock_owner_pid,
+                            lock_path=lock_path,
                         )
                     )
             except Exception:
@@ -2853,12 +2982,69 @@ def main() -> None:
             return
         lock_held = True
 
+    if not args.dry_run and not startup_at is None:
+        try:
+            mode = "--once" if args.once else "continuous"
+            startup_message = (
+                "✅ Бот changelog-watch-telegram-bot запущен."
+                f" Режим: {mode}."
+                f" PID: {os.getpid()}."
+                f" Config: {args.config}."
+                f" DB: {args.db}."
+                f" Время запуска: {startup_at.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+            )
+            asyncio.run(
+                notify_admin_lifecycle_event(
+                    telegram_token=telegram_token,
+                    routing_config_path=routing_config_path,
+                    message=startup_message,
+                )
+            )
+            lifecycle_notifications_enabled = bool(telegram_token and load_admin_ids_for_notifications(routing_config_path))
+        except Exception:
+            LOG.exception("failed to send bot startup admin notification")
+
     try:
         if args.once:
-            asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run))
+            asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path))
         else:
-            asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run))
+            asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path))
+    except BaseException as exc:
+        lifecycle_error = exc
+        raise
     finally:
+        if lifecycle_notifications_enabled and not args.dry_run:
+            stopped_at = datetime.now(timezone.utc)
+            elapsed_seconds = max(0.0, (stopped_at - startup_at).total_seconds())
+
+            if lifecycle_error is None:
+                stop_reason = "остановлен"
+            elif isinstance(lifecycle_error, KeyboardInterrupt):
+                stop_reason = "получен сигнал остановки"
+            elif isinstance(lifecycle_error, SystemExit):
+                stop_reason = "завершение по команде"
+            else:
+                stop_reason = f"ошибка: {type(lifecycle_error).__name__}"
+
+            stop_message = (
+                "⛔ Бот changelog-watch-telegram-bot остановлен."
+                f" Причина: {stop_reason}."
+                f" Режим: {'--once' if args.once else 'continuous'}."
+                f" Время остановки: {stopped_at.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+                f" Время работы: {elapsed_seconds:.1f} сек."
+                f" PID: {os.getpid()}."
+            )
+            try:
+                asyncio.run(
+                    notify_admin_lifecycle_event(
+                        telegram_token=telegram_token,
+                        routing_config_path=routing_config_path,
+                        message=stop_message,
+                    )
+                )
+            except Exception:
+                LOG.exception("failed to send bot stop admin notification")
+
         if lock_held:
             release_single_instance_lock()
 

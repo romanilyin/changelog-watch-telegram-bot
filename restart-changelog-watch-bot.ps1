@@ -13,6 +13,8 @@ param(
 
     [int]$WaitSeconds = 12,
 
+    [string]$SystemdServiceName = "",
+
     [switch]$Tail,
 
     [int]$TailLines = 80
@@ -25,7 +27,7 @@ if (-not (Test-Path -LiteralPath $PSScriptRoot -PathType Container)) {
 }
 
 Write-Host "[restart] stopping existing instances..." -ForegroundColor Cyan
-& "$PSScriptRoot\stop-changelog-watch-bot.ps1" -WslDistro $WslDistro -WindowsRepoPath $WindowsRepoPath -WaitSeconds $WaitSeconds
+& "$PSScriptRoot\stop-changelog-watch-bot.ps1" -WslDistro $WslDistro -WindowsRepoPath $WindowsRepoPath -WaitSeconds $WaitSeconds -SystemdServiceName $SystemdServiceName
 
 Write-Host "[restart] starting fresh instance..." -ForegroundColor Cyan
 & "$PSScriptRoot\start-changelog-watch-bot.ps1" -WslDistro $WslDistro -WindowsRepoPath $WindowsRepoPath -Force -DryRun:$DryRun -Once:$Once -BotArgs $BotArgs -Tail:$Tail -TailLines $TailLines

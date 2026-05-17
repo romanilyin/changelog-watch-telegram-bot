@@ -19,6 +19,7 @@ requirements.txt
 start-changelog-watch-bot.ps1
 stop-changelog-watch-bot.ps1
 restart-changelog-watch-bot.ps1
+status-changelog-watch-bot.ps1
 docs/INSTALL_WSL.md
 docs/ADMIN_DESIGN.md
 systemd/changelog-watch-bot.service.example
@@ -51,6 +52,10 @@ python bot.py
 - `./start-changelog-watch-bot.ps1` — запуск через WSL.
 - `./stop-changelog-watch-bot.ps1` — остановка через WSL.
 - `./restart-changelog-watch-bot.ps1` — остановка + запуск нового экземпляра.
+- `./status-changelog-watch-bot.ps1` — проверка статуса бот-экземпляров, lock, pid и логов (`-Tail` / `-TailLines`), опционально уведомление админам (`-NotifyAdmins`).
+- `status-changelog-watch-bot.ps1` также показывает связанные `systemd --user` юниты.
+- Для процессов, которые управляются `systemd --user`, `stop-changelog-watch-bot.ps1` пытается сам определить соответствующий юнит по `ExecStart` и остановить его.
+  При необходимости можно указать `-SystemdServiceName` (например `changelog-watch-bot.service`) явно.
 
 Для всех `start`/`restart` скриптов, включая PowerShell-обертки, аргументы пробрасываются в `python bot.py`, поэтому можно запускать, например:
 
@@ -63,6 +68,11 @@ python bot.py
 ./start-changelog-watch-bot.ps1 -Once -DryRun -BotArgs @("--config", "products.yaml")
 ./restart-changelog-watch-bot.ps1 -DryRun
 ./stop-changelog-watch-bot.ps1 -WaitSeconds 15
+./stop-changelog-watch-bot.ps1 -SystemdServiceName changelog-watch-bot.service
+./restart-changelog-watch-bot.ps1 -SystemdServiceName changelog-watch-bot.service
+./status-changelog-watch-bot.ps1 -Tail
+./status-changelog-watch-bot.ps1 -Tail -TailLines 120
+./status-changelog-watch-bot.ps1 -NotifyAdmins
 ```
 
 Переменная окружения `BOT_INSTANCE_LOCK_PATH` позволяет переопределить путь блокировки одиночного инстанса (`--dry-run` блокировку не использует).
@@ -203,7 +213,7 @@ chats:
 
 Для `summary_schedule` поддерживаются режимы:
 - `immediate` (без отсрочки)
-- `daily` (по `time`, отправка каждый день после дедлайна)
+- `daily` (по `time`, отправка каждый день после дедлайна, при отсутствии истории отправки — первый раз в ближайшее время после `time`)
 - `weekly` (по `time` + `weekday`)
 - `none` (сводка отключена для данного чата)
 

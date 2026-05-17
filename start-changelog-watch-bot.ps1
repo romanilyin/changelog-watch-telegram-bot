@@ -168,6 +168,103 @@ is_bot_process() {
     return 0
 }
 
+proc_cmdline() {
+    local pid="$1"
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+}
+
+is_systemd_user_process() {
+    local pid="$1"
+    local ppid=""
+    local parent_cmd=""
+
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$ppid" ]; then
+        return 1
+    fi
+
+    parent_cmd="$(proc_cmdline "$ppid")"
+    if [[ "$parent_cmd" == *"systemd --user"* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_systemd_units_for_repo() {
+    local -a target_pids=("$@")
+    local script_abs
+    local -a units=()
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    script_abs="$(readlink -f "$REPO/bot.py")"
+
+    while IFS= read -r unit; do
+        if [ -z "$unit" ]; then
+            continue
+        fi
+
+        local exec_start
+        local match
+        local main_pid
+
+        exec_start="$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null | tr -d '\r')"
+        if [ -z "$exec_start" ]; then
+            continue
+        fi
+
+        match=0
+        if [[ "$exec_start" == *"$script_abs"* ]] || [[ "$exec_start" == *"$REPO/bot.py"* ]]; then
+            match=1
+        elif [ ${#target_pids[@]} -gt 0 ]; then
+            main_pid="$(systemctl --user show "$unit" --property=ExecMainPID --value 2>/dev/null | tr -d '\r' | tr -d '[:space:]')"
+            if [ -n "$main_pid" ] && [[ "$main_pid" =~ ^[0-9]+$ ]]; then
+                for target_pid in "${target_pids[@]}"; do
+                    if [ "$target_pid" = "$main_pid" ]; then
+                        match=1
+                        break
+                    fi
+                done
+            fi
+        fi
+
+        if [ "$match" -eq 1 ]; then
+            units+=("$unit")
+        fi
+    done < <(systemctl --user list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+
+    if [ ${#units[@]} -eq 0 ]; then
+        return 1
+    fi
+
+    printf '%s\n' "${units[@]}"
+}
+
+stop_systemd_service() {
+    local service_name="$1"
+
+    if [ -z "$service_name" ]; then
+        return 0
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl not available in WSL environment"
+        return 0
+    fi
+
+    if systemctl --user is-active "$service_name" >/dev/null 2>&1; then
+        warn "attempting to stop systemd --user service: $service_name"
+        systemctl --user stop "$service_name" || warn "unable to stop systemd --user service: $service_name"
+    fi
+}
+
 collect_existing_pids() {
     local -a pids=()
     local pid
@@ -228,15 +325,62 @@ dedupe_pids() {
     printf '%s\n' "${out[@]}"
 }
 
+normalize_pids() {
+    local -a out=()
+    local pid
+
+    for pid in "$@"; do
+        pid="${pid//[[:space:]]/}"
+
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then
+            out+=("$pid")
+        fi
+    done
+
+    if [ ${#out[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    printf '%s\n' "${out[@]}"
+}
+
 mapfile -t EXISTING_RAW_PIDS < <(collect_existing_pids)
 mapfile -t EXISTING_PIDS < <(dedupe_pids "${EXISTING_RAW_PIDS[@]}")
+mapfile -t EXISTING_PIDS < <(normalize_pids "${EXISTING_PIDS[@]}")
+mapfile -t SYSTEMD_UNITS < <(resolve_systemd_units_for_repo "${EXISTING_PIDS[@]}" || true)
 
 if [ "${#EXISTING_PIDS[@]}" -gt 0 ]; then
     if [ "$FORCE" != "1" ]; then
+        systemd_managed=0
+        for pid in "${EXISTING_PIDS[@]}"; do
+            if is_systemd_user_process "$pid"; then
+                systemd_managed=1
+                break
+            fi
+        done
+
+        if [ "$systemd_managed" -eq 1 ]; then
+            warn "running instance(s) may be managed by systemd --user"
+            if [ ${#SYSTEMD_UNITS[@]} -gt 0 ]; then
+                warn "possible manager unit(s): ${SYSTEMD_UNITS[*]}"
+            fi
+            warn "check: systemctl --user list-units --type=service --state=running | grep -i changelog"
+        fi
+
         fail "bot is already running (pid: ${EXISTING_PIDS[*]}). Use -Force to stop previous instance and start new."
     fi
 
+    if [ ${#SYSTEMD_UNITS[@]} -gt 0 ]; then
+        warn "stopping matching systemd --user unit(s): ${SYSTEMD_UNITS[*]}"
+        for systemd_unit in "${SYSTEMD_UNITS[@]}"; do
+            stop_systemd_service "$systemd_unit"
+        done
+    fi
+
     for pid in "${EXISTING_PIDS[@]}"; do
+        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
         if kill -0 "$pid" 2>/dev/null; then
             warn "stopping existing pid=$pid"
             kill -TERM "$pid" || true
@@ -246,6 +390,9 @@ if [ "${#EXISTING_PIDS[@]}" -gt 0 ]; then
     for attempt in {1..8}; do
         all_stopped=true
         for pid in "${EXISTING_PIDS[@]}"; do
+            if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+                continue
+            fi
             if kill -0 "$pid" 2>/dev/null; then
                 all_stopped=false
                 break
@@ -259,6 +406,9 @@ if [ "${#EXISTING_PIDS[@]}" -gt 0 ]; then
     done
 
     for pid in "${EXISTING_PIDS[@]}"; do
+        if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
         if kill -0 "$pid" 2>/dev/null; then
             kill -KILL "$pid" || true
         fi
