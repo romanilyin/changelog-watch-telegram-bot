@@ -22,6 +22,7 @@ python bot.py --validate-config
 python bot.py --once --dry-run
 python bot.py --once
 python bot.py
+./scripts/check-local.sh
 ```
 
 `--dry-run` не отправляет Telegram-сообщения, не берёт singleton-lock и по умолчанию не вызывает AI API. Для существующей БД dry-run работает с in-memory копией и не меняет файл SQLite.
@@ -30,6 +31,9 @@ python bot.py
 
 ```bash
 python bot.py --validate-config
+python bot.py --validate-config --migrate-db
+python bot.py --import-routing --replace
+python bot.py --clear-summary-queue --chat-id 185073278
 python bot.py --once --dry-run
 python bot.py --once
 python bot.py
@@ -68,6 +72,8 @@ Windows PowerShell 7 + WSL:
 - `DUPLICATE_INSTANCE_NOTIFICATIONS_ENABLED=true` — уведомления о конфликте инстансов.
 - `TELEGRAM_CHAT_ID` — legacy, routing mode его игнорирует.
 
+Для личных уведомлений без digest добавь свой `chat_id` в `admin-routing.yaml`; пример есть в `docs/CONFIG.md#personal-chat-example`.
+
 Подробно: `docs/CONFIG.md`.
 
 ## Документация
@@ -88,6 +94,7 @@ rm data/posted.sqlite3
 
 Для удаления только случайно накопленной digest-очереди:
 
-```sql
-DELETE FROM summary_queue;
+```bash
+python bot.py --clear-summary-queue
+python bot.py --clear-summary-queue --chat-id 185073278
 ```

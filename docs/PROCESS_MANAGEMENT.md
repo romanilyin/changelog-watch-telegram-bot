@@ -62,6 +62,7 @@
 
 ```powershell
 ./restart-changelog-watch-bot.ps1 -CheckOnce
+./restart-changelog-watch-bot.ps1 -CheckOnce -Tail
 ```
 
 `-CheckOnce` сначала запускает внутри WSL:
@@ -74,9 +75,10 @@ python bot.py --once --dry-run
 
 ```powershell
 ./restart-changelog-watch-bot.ps1 -CheckOnce -ForceCheckFailure
+./restart-changelog-watch-bot.ps1 -CheckOnce -ForceCheckFailure -Tail
 ```
 
-Dry-run precheck не отправляет Telegram-сообщения и не отправляет lifecycle notifications.
+Dry-run precheck не отправляет Telegram-сообщения, не отправляет lifecycle notifications и не вызывает AI API, если `AI_SUMMARY_DRY_RUN_CALL_API=true` не задан явно.
 
 ## Status
 

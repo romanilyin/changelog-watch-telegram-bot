@@ -15,6 +15,21 @@ ROUTING_SEED_MODE=once
 
 `TELEGRAM_BOT_TOKEN` нужен только для реальных отправок. Для `--dry-run` он может отсутствовать.
 
+Рекомендуемые локальные добавления:
+
+```env
+ROUTING_CONFIG_PATH=admin-routing.yaml
+ROUTING_SEED_MODE=once
+BOT_INSTANCE_LOCK_PATH=data/changelog-watch-telegram-bot.lock
+LIFECYCLE_NOTIFICATIONS_ENABLED=false
+DUPLICATE_INSTANCE_NOTIFICATIONS_ENABLED=true
+AI_SUMMARY_DRY_RUN_CALL_API=false
+AI_SUMMARY_IN_DIGEST=true
+DISPLAY_TIMEZONE=Europe/Moscow
+```
+
+`TELEGRAM_CHAT_ID=...` — legacy; его лучше удалить из `.env` или оставить как неиспользуемую старую переменную.
+
 ## Legacy `TELEGRAM_CHAT_ID`
 
 `TELEGRAM_CHAT_ID` больше не управляет рассылкой. Routing mode его игнорирует и пишет warning:
@@ -36,6 +51,12 @@ TELEGRAM_CHAT_ID is legacy and ignored by routing mode. Add this chat_id to admi
 - `off` — не импортировать seed автоматически.
 
 Рекомендуемый режим: `once`. Тогда изменения `/subscribe` и `/unsubscribe`, записанные в SQLite, не перетираются следующим reload. В режиме `sync` seed может снова добавить или перезаписать то, что менялось в runtime.
+
+Если `data/posted.sqlite3` уже существует и `ROUTING_SEED_MODE=once`, изменения в `admin-routing.yaml` не перепишут routing DB автоматически. Чтобы применить seed без удаления истории публикаций, используй:
+
+```bash
+python bot.py --import-routing --replace
+```
 
 Если `ROUTING_CONFIG_PATH` не задан и routing DB пустая, запуск падает с понятной ошибкой:
 
@@ -86,6 +107,45 @@ chats:
 
 `summary_schedule.mode: immediate` отправляет digest сразу только когда он явно указан.
 
+## Personal Chat Example
+
+Для личных уведомлений без digest summaries:
+
+```yaml
+admins:
+  - id: 185073278
+    alias: roman
+
+source_groups:
+  all:
+    - opencode_changelog
+    - openchamber_changelog
+    - codenomad_releases
+    - unity_ivanmurzak_releases
+    - unity_coplay_releases
+    - locus_releases
+
+chats:
+  - chat_id: 185073278
+    alias: main
+    title: Личные уведомления
+    groups:
+      - all
+    sources: []
+    enabled: true
+    send_summary: false
+    delivery_mode: instant
+    summary_on_startup: false
+    summary_schedule:
+      mode: none
+```
+
+Важно:
+
+- `TELEGRAM_CHAT_ID` legacy и routing mode его игнорирует.
+- `admin-routing.yaml` игнорируется git через `.gitignore`, поэтому локальные chat ids не попадут в репозиторий.
+- При `ROUTING_SEED_MODE=once` существующая routing DB не переписывается изменениями YAML; используй `python bot.py --import-routing --replace`, временно `ROUTING_SEED_MODE=sync` или полный сброс DB.
+
 ## Summaries
 
 Digest отправляется только для `delivery_mode: digest` или `delivery_mode: both`, если `summary_schedule.mode` не `none`.
@@ -105,6 +165,15 @@ summary_schedule:
 DELETE FROM summary_queue;
 ```
 
+Или безопаснее через CLI без network calls:
+
+```bash
+python bot.py --clear-summary-queue
+python bot.py --clear-summary-queue --chat-id 185073278
+```
+
+Команда удаляет только строки из `summary_queue`; `posted_items`, `deliveries`, `source_state` и `ai_summaries` не трогаются.
+
 Опционально можно не отправлять старые queued items:
 
 ```env
@@ -112,6 +181,15 @@ SUMMARY_QUEUE_MAX_AGE_DAYS=14
 ```
 
 Если переменная пустая, фильтр выключен. Старые элементы не отправляются, skipped count пишется в лог.
+
+По умолчанию stale rows остаются в `summary_queue`, чтобы не удалять данные молча. Если нужно удалять skipped stale rows автоматически:
+
+```env
+SUMMARY_QUEUE_MAX_AGE_DAYS=14
+SUMMARY_QUEUE_PRUNE_STALE=true
+```
+
+При `SUMMARY_QUEUE_PRUNE_STALE=false` stale rows остаются до ручной очистки.
 
 ## Products
 
@@ -154,6 +232,12 @@ sources:
 python bot.py --validate-config
 ```
 
+По умолчанию validation использует in-memory копию SQLite и не меняет DB-файл. Если нужно явно открыть и мигрировать реальную БД:
+
+```bash
+python bot.py --validate-config --migrate-db
+```
+
 Проверяется:
 
 - `products.yaml` загружается;
@@ -163,7 +247,28 @@ python bot.py --validate-config
 - routing YAML загружается, если задан `ROUTING_CONFIG_PATH`;
 - routing source references существуют;
 - summary schedule values валидны;
-- SQLite DB открывается и мигрирует.
+- SQLite DB открывается и проверяется; миграции реальной БД выполняются только с `--migrate-db`.
+
+## Routing Import
+
+Применить `admin-routing.yaml` к существующей SQLite DB без удаления истории публикаций:
+
+```bash
+python bot.py --import-routing --replace
+```
+
+Команда:
+
+- загружает `products.yaml`;
+- валидирует `ROUTING_CONFIG_PATH` против source ids;
+- заменяет routing tables из seed;
+- не удаляет `posted_items`, `source_state`, `deliveries`, `summary_queue`, `ai_summaries`.
+
+Если нужно одновременно убрать накопленную digest-очередь:
+
+```bash
+python bot.py --import-routing --replace --clear-summary-queue
+```
 
 ## Dry-Run
 

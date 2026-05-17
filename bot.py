@@ -144,6 +144,10 @@ def ai_summary_in_digest_enabled() -> bool:
     return env_bool("AI_SUMMARY_IN_DIGEST", True)
 
 
+def summary_queue_prune_stale_enabled() -> bool:
+    return env_bool("SUMMARY_QUEUE_PRUNE_STALE", False)
+
+
 def default_single_instance_lock_path() -> Path:
     script_path = Path(__file__).resolve()
     lock_suffix = hashlib.sha1(script_path.as_posix().encode("utf-8")).hexdigest()[:16]
@@ -588,12 +592,35 @@ def ensure_routing_state_seeded(
         raise RuntimeError(f"routing seed file not found: {source_config_path}")
 
     route_config = load_routing_config(source_path, source_ids)
-    import_routing_config_to_db(conn, route_config)
+    import_routing_config_to_db(conn, route_config, replace=seed_mode == "sync")
 
 
-def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig) -> None:
+def replace_routing_tables(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("DELETE FROM routing_chat_sources")
+        conn.execute("DELETE FROM routing_chat_groups")
+        conn.execute("DELETE FROM routing_source_group_sources")
+        conn.execute("DELETE FROM routing_source_groups")
+        conn.execute("DELETE FROM routing_chats")
+        conn.execute("DELETE FROM routing_admins")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
+
+
+def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig, *, replace: bool = False) -> None:
+    if replace:
+        replace_routing_tables(conn)
+
     admin_alias_lookup: dict[str, str] = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
-    conn.execute("DELETE FROM routing_admins")
+    if not replace:
+        conn.execute("DELETE FROM routing_admins")
     for admin_id in routing.admins:
         admin_alias = admin_alias_lookup.get(admin_id)
         conn.execute(
@@ -1927,10 +1954,12 @@ def load_summary_queue_items(
 
     result: list[tuple[str, ChangelogEntry]] = []
     skipped_stale = 0
+    stale_keys: list[tuple[str, str, str]] = []
     for row in rows:
         created_at = parse_sqlite_datetime(row["created_at"])
         if cutoff is not None and created_at is not None and created_at < cutoff:
             skipped_stale += 1
+            stale_keys.append((chat_id, row["source_id"], row["item_id"]))
             continue
 
         result.append(
@@ -1949,12 +1978,26 @@ def load_summary_queue_items(
         )
     if skipped_stale:
         LOG.warning("summary queue for chat %s skipped %d stale item(s)", chat_id, skipped_stale)
+        if summary_queue_prune_stale_enabled():
+            delete_summary_queue_keys(conn, stale_keys)
+            LOG.warning("summary queue for chat %s pruned %d stale item(s)", chat_id, skipped_stale)
     return result
 
 
 def clear_summary_queue(conn: sqlite3.Connection, chat_id: str) -> None:
     conn.execute("DELETE FROM summary_queue WHERE chat_id = ?", (chat_id,))
     conn.commit()
+
+
+def delete_summary_queue_keys(conn: sqlite3.Connection, keys: list[tuple[str, str, str]]) -> int:
+    if not keys:
+        return 0
+    cursor = conn.executemany(
+        "DELETE FROM summary_queue WHERE chat_id = ? AND source_id = ? AND item_id = ?",
+        keys,
+    )
+    conn.commit()
+    return cursor.rowcount if cursor.rowcount is not None else 0
 
 
 def clear_summary_queue_items(conn: sqlite3.Connection, chat_id: str, entries: list[tuple[str, ChangelogEntry]]) -> None:
@@ -3236,7 +3279,7 @@ def validate_source_config(config: dict[str, Any]) -> set[str]:
     return source_ids
 
 
-def validate_config_files(config_path: str, db_path: str) -> None:
+def validate_config_files(config_path: str, db_path: str, *, migrate_db: bool = False) -> None:
     errors: list[str] = []
     source_ids: set[str] = set()
 
@@ -3252,7 +3295,8 @@ def validate_config_files(config_path: str, db_path: str) -> None:
         errors.append(str(exc))
 
     try:
-        with db_connect(db_path) as conn:
+        db_factory = db_connect if migrate_db else db_connect_for_dry_run
+        with db_factory(db_path) as conn:
             routing_config_path = get_routing_config_path()
             if routing_config_path:
                 load_routing_config(routing_config_path, source_ids)
@@ -3269,7 +3313,48 @@ def validate_config_files(config_path: str, db_path: str) -> None:
     if errors:
         raise RuntimeError("config validation failed:\n- " + "\n- ".join(errors))
 
-    LOG.info("config validation passed")
+    migration_note = "with DB migration" if migrate_db else "without DB writes"
+    LOG.info("config validation passed (%s)", migration_note)
+
+
+def load_validated_routing_seed(config_path: str) -> RoutingConfig:
+    config = load_config(config_path)
+    source_ids = validate_source_config(config)
+    routing_config_path = get_routing_config_path()
+    if not routing_config_path:
+        raise RuntimeError("ROUTING_CONFIG_PATH is required for --import-routing")
+    return load_routing_config(routing_config_path, source_ids)
+
+
+def import_routing_from_seed(config_path: str, db_path: str, *, replace: bool) -> None:
+    routing = load_validated_routing_seed(config_path)
+    with db_connect(db_path) as conn:
+        import_routing_config_to_db(conn, routing, replace=replace)
+    mode = "replaced" if replace else "merged"
+    LOG.info(
+        "routing %s from seed: admins=%d groups=%d chats=%d",
+        mode,
+        len(routing.admins),
+        len(routing.source_groups),
+        len(routing.chats),
+    )
+
+
+def clear_summary_queue_rows(conn: sqlite3.Connection, chat_id: str | None = None) -> int:
+    if chat_id:
+        normalized_chat_id = normalize_chat_id(chat_id, "--chat-id")
+        cursor = conn.execute("DELETE FROM summary_queue WHERE chat_id = ?", (normalized_chat_id,))
+    else:
+        cursor = conn.execute("DELETE FROM summary_queue")
+    conn.commit()
+    return cursor.rowcount if cursor.rowcount is not None else 0
+
+
+def clear_summary_queue_command(db_path: str, chat_id: str | None = None) -> None:
+    with db_connect(db_path) as conn:
+        removed_rows = clear_summary_queue_rows(conn, chat_id)
+    target = f"chat {normalize_chat_id(chat_id, '--chat-id')}" if chat_id else "all chats"
+    LOG.info("summary queue cleared for %s: removed %d row(s)", target, removed_rows)
 
 
 def warn_legacy_telegram_chat_id() -> None:
@@ -3287,7 +3372,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="Run one check and exit")
     parser.add_argument("--dry-run", action="store_true", help="Do not send Telegram messages; log what would be posted")
     parser.add_argument("--validate-config", action="store_true", help="Validate local config and DB schema without network calls")
-    return parser.parse_args()
+    parser.add_argument("--migrate-db", action="store_true", help="Allow --validate-config to migrate the real DB")
+    parser.add_argument("--import-routing", action="store_true", help="Import routing seed from ROUTING_CONFIG_PATH")
+    parser.add_argument("--replace", action="store_true", help="Replace routing tables during --import-routing")
+    parser.add_argument("--clear-summary-queue", action="store_true", help="Clear digest summary queue without network calls")
+    parser.add_argument("--chat-id", help="Limit --clear-summary-queue to one Telegram chat id")
+    args = parser.parse_args()
+
+    if args.migrate_db and not args.validate_config:
+        parser.error("--migrate-db requires --validate-config")
+    if args.replace and not args.import_routing:
+        parser.error("--replace requires --import-routing")
+    if args.chat_id and not args.clear_summary_queue:
+        parser.error("--chat-id requires --clear-summary-queue")
+    if args.validate_config and (args.import_routing or args.clear_summary_queue):
+        parser.error("--validate-config cannot be combined with --import-routing or --clear-summary-queue")
+
+    return args
 
 
 def main() -> None:
@@ -3296,7 +3397,15 @@ def main() -> None:
     args = parse_args()
     warn_legacy_telegram_chat_id()
     if args.validate_config:
-        validate_config_files(args.config, args.db)
+        validate_config_files(args.config, args.db, migrate_db=args.migrate_db)
+        return
+    if args.import_routing:
+        import_routing_from_seed(args.config, args.db, replace=args.replace)
+        if args.clear_summary_queue:
+            clear_summary_queue_command(args.db, args.chat_id)
+        return
+    if args.clear_summary_queue:
+        clear_summary_queue_command(args.db, args.chat_id)
         return
 
     lock_path = env_text("BOT_INSTANCE_LOCK_PATH")
