@@ -15,6 +15,10 @@ param(
 
     [string]$SystemdServiceName = "",
 
+    [switch]$CheckOnce,
+
+    [switch]$ForceCheckFailure,
+
     [switch]$Tail,
 
     [int]$TailLines = 80
@@ -24,6 +28,61 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path -LiteralPath $PSScriptRoot -PathType Container)) {
     throw "Script directory not found: $PSScriptRoot"
+}
+
+function Convert-ToWslPath {
+    param([string]$Path)
+
+    $resolved = [System.IO.Path]::GetFullPath($Path)
+    if ($resolved -match "^([A-Za-z]):[\\/](.*)$") {
+        $drive = $matches[1].ToLower()
+        $rest = $matches[2] -replace "\\", "/"
+        return "/mnt/$drive/$rest"
+    }
+
+    return $resolved
+}
+
+function Invoke-WslBot {
+    param([string[]]$Arguments)
+
+    $wslArgs = @()
+    if ($WslDistro) {
+        $wslArgs += @("-d", $WslDistro)
+    }
+
+    $wslArgs += $Arguments
+    & wsl.exe @wslArgs
+    return $LASTEXITCODE
+}
+
+if ($CheckOnce) {
+    if (-not (Test-Path -LiteralPath $WindowsRepoPath -PathType Container)) {
+        throw "Repo path not found: $WindowsRepoPath"
+    }
+
+    $repoWslPath = Convert-ToWslPath $WindowsRepoPath
+    $repoWslPathForBash = $repoWslPath -replace "'", "'\"'\"'"
+    $precheckScriptTemplate = @'
+cd '__REPO__'
+python_bin="${VENV_PYTHON:-$PWD/.venv/bin/python}"
+if [ ! -x "$python_bin" ]; then
+    python_bin="$(command -v python3 || command -v python)"
+fi
+"$python_bin" bot.py --once --dry-run
+'@
+    $precheckScript = $precheckScriptTemplate.Replace("__REPO__", $repoWslPathForBash)
+
+    Write-Host "[restart] running dry-run precheck..." -ForegroundColor Cyan
+    Invoke-WslBot -Arguments @("--", "bash", "-lc", $precheckScript)
+    $precheckExitCode = $LASTEXITCODE
+
+    if ($precheckExitCode -ne 0) {
+        if (-not $ForceCheckFailure) {
+            throw "Dry-run precheck failed. Existing bot was not stopped. WSL exit code: $precheckExitCode"
+        }
+        Write-Warning "Dry-run precheck failed, continuing because -ForceCheckFailure was passed. WSL exit code: $precheckExitCode"
+    }
 }
 
 Write-Host "[restart] stopping existing instances..." -ForegroundColor Cyan

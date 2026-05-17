@@ -57,16 +57,18 @@ nano admin-routing.yaml
 TELEGRAM_BOT_TOKEN=токен_от_BotFather
 DB_PATH=data/posted.sqlite3
 ROUTING_CONFIG_PATH=admin-routing.yaml
-# ROUTING_CONFIG_PATH используется как seed для первого импорта в БД.
-# Опционально: явный путь к lock-файлу singleton.
-# Если пусто, путь берется автоматически на основе абсолютного пути bot.py.
-BOT_INSTANCE_LOCK_PATH=
+ROUTING_SEED_MODE=once
+BOT_INSTANCE_LOCK_PATH=data/changelog-watch-telegram-bot.lock
 ROUTING_RELOAD_TTL_SECONDS=0
 ADMIN_POLL_TIMEOUT=25
 ADMIN_COMMAND_POLL_SECONDS=2
+LIFECYCLE_NOTIFICATIONS_ENABLED=false
+DUPLICATE_INSTANCE_NOTIFICATIONS_ENABLED=true
 DISPLAY_TIMEZONE=Europe/Amsterdam
 GITHUB_TOKEN=ghp_xxx
 ```
+
+`TELEGRAM_CHAT_ID` — legacy и routing mode его игнорирует. Нужный chat id указывай в `admin-routing.yaml`.
 
 ### Как узнать `chat_id` для `admin-routing.yaml`
 
@@ -103,6 +105,12 @@ python bot.py --once
 python bot.py --once --dry-run
 ```
 
+Для проверки конфигов без network calls:
+
+```bash
+python bot.py --validate-config
+```
+
 ## 6. Запуск в терминале WSL
 
 ```bash
@@ -127,14 +135,14 @@ python bot.py
 
 ```powershell
 pwsh ./start-changelog-watch-bot.ps1 -Once -DryRun
-pwsh ./restart-changelog-watch-bot.ps1
+pwsh ./restart-changelog-watch-bot.ps1 -CheckOnce
 pwsh ./stop-changelog-watch-bot.ps1
 pwsh ./stop-changelog-watch-bot.ps1  # автоопределение systemd-юнита по bot.py
 pwsh ./stop-changelog-watch-bot.ps1 -SystemdServiceName changelog-watch-bot.service
 pwsh ./status-changelog-watch-bot.ps1 -Tail
 ```
 
-Аргумент `--once` и `--dry-run` также пробрасывается через `start`/`restart`.
+Аргумент `--once` и `--dry-run` также пробрасывается через `start`/`restart`. Подробно: `docs/PROCESS_MANAGEMENT.md`.
 
 ## 7. Удобный запуск через `tmux`, если нужен долгий тест
 
@@ -189,12 +197,15 @@ sudo journalctl -u changelog-watch-bot -f
 ps -eo pid,args | grep '/changelog-watch-telegram-bot/bot.py' | grep -v grep
 ```
 
-Если старый процесс уже завершен, а конфликт продолжает появляться, можно удалить lock-файл:
+Если старый процесс уже завершен, а конфликт продолжает появляться, лучше сначала запустить `pwsh ./stop-changelog-watch-bot.ps1`: он удаляет stale `data/bot.pid` и stale lock. Вручную удалить lock-файл можно так:
 
 ```bash
 source .env
 if [ -n "${BOT_INSTANCE_LOCK_PATH:-}" ]; then
-  rm -f "$BOT_INSTANCE_LOCK_PATH"
+  case "$BOT_INSTANCE_LOCK_PATH" in
+    /*) rm -f "$BOT_INSTANCE_LOCK_PATH" ;;
+    *) rm -f "$(pwd)/$BOT_INSTANCE_LOCK_PATH" ;;
+  esac
 fi
 
 # если переменная не задавалась в .env
@@ -202,6 +213,8 @@ rm -f /tmp/changelog-watch-telegram-bot-*.lock
 ```
 
 `--dry-run` блокировку не использует, поэтому для проверки конфликтов запускай обычный `python bot.py --once`.
+
+Подробные настройки см. в `docs/CONFIG.md` и `docs/PROCESS_MANAGEMENT.md`.
 
 ## 9. Перенос на рабочий сервер позже
 

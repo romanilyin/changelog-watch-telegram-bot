@@ -3,10 +3,10 @@
 - Всегда писать в чате на русском.
 - This repo is a single-file Python bot (`bot.py`) with `products.yaml`-driven config, no monorepo boundaries, no additional packages/modules to discover.
 - Run commands are the only reliable entrypoints: `python3`/`python` with flags (`--once`, `--dry-run`, `--config`, `--db`) defined in `bot.py`.
-- Setup is straightforward but strict: create/activate `.venv`, `pip install -r requirements.txt`, then `cp .env.example .env` and fill `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
+- Setup is straightforward but strict: create/activate `.venv`, `pip install -r requirements.txt`, then `cp .env.example .env`, `cp admin-routing.example.yaml admin-routing.yaml`, fill `TELEGRAM_BOT_TOKEN`, and put target chats into `admin-routing.yaml`.
 - Dry-run is safe for verification: `python bot.py --once --dry-run` parses and logs candidate posts without Telegram API calls.
 - Regular one-shot run is `python bot.py --once`; continuous mode `python bot.py` starts scheduler, runs one immediate check, then sleeps on 30-minute default interval.
-- `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are only required when `--dry-run` is not set; with dry-run they can be absent.
+- `TELEGRAM_BOT_TOKEN` is only required when `--dry-run` is not set; with dry-run it can be absent. `TELEGRAM_CHAT_ID` is legacy and ignored by routing mode.
 - `CONFIG_PATH` and `DB_PATH` env vars override the CLI defaults (and can still be overridden by `--config`/`--db`).
 - Config format is strict: top-level `poll_minutes` and a `sources` list in YAML; `load_config` throws if `sources` is missing or not a list.
 - `source.id` is the dedupe key in SQLite and controls re-post behavior; changing it will look like fresh items.

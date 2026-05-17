@@ -105,15 +105,27 @@ fi
         local script_abs
         local lock_suffix
 
+        normalize_lock_path() {
+            local raw_path="$1"
+            if [ -z "$raw_path" ]; then
+                return 1
+            fi
+            if [[ "$raw_path" == /* ]]; then
+                printf '%s\n' "$raw_path"
+            else
+                printf '%s/%s\n' "$REPO" "$raw_path"
+            fi
+        }
+
         if [ -n "$env_lock" ]; then
-            printf '%s\n' "$env_lock"
+            normalize_lock_path "$env_lock"
             return
         fi
 
         if [ -f "$env_file" ]; then
             repo_lock="$(grep -E '^[[:space:]]*BOT_INSTANCE_LOCK_PATH[[:space:]]*=' "$env_file" | tail -n1 | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]' | tr -d '"' | tr -d "'")"
             if [ -n "$repo_lock" ]; then
-                printf '%s\n' "$repo_lock"
+                normalize_lock_path "$repo_lock"
                 return
             fi
         fi
@@ -291,16 +303,18 @@ collect_existing_pids() {
 
         if [[ "$pid_file" =~ ^[0-9]+$ ]] && is_bot_process "$pid_file"; then
             pids+=("$pid_file")
+        elif [ -n "$pid_file" ]; then
+            rm -f "$PID_FILE"
         fi
     fi
 
     if [ -f "$LOCK_FILE" ]; then
         local lock_pid
-        lock_pid="$(read_lock_pid "$LOCK_FILE")"
+        lock_pid="$(read_lock_pid "$LOCK_FILE" || true)"
 
         if [ -n "$lock_pid" ] && is_bot_process "$lock_pid"; then
             pids+=("$lock_pid")
-        elif [ -n "$lock_pid" ]; then
+        else
             rm -f "$LOCK_FILE"
         fi
     fi

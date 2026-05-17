@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 import fcntl
 
 LOG = logging.getLogger("changelog-watch-bot")
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_VERSION_RE = r"^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
 MD_VERSION_HEADING_RE = re.compile(
@@ -85,10 +86,79 @@ _single_instance_lock_path: Path | None = None
 _DUPLICATE_INSTANCE_ALERT_COOLDOWN_SECONDS = 60
 
 
+def env_text(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_bool_value(value: Any, context: str, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{context} must be a boolean value")
+
+
+def get_routing_config_path() -> str | None:
+    return env_text("ROUTING_CONFIG_PATH")
+
+
+def get_routing_seed_mode() -> str:
+    mode = os.getenv("ROUTING_SEED_MODE", "once").strip().lower() or "once"
+    if mode not in {"once", "sync", "off"}:
+        raise RuntimeError("ROUTING_SEED_MODE must be one of once|sync|off")
+    return mode
+
+
+def lifecycle_notifications_are_enabled() -> bool:
+    return env_bool("LIFECYCLE_NOTIFICATIONS_ENABLED", False)
+
+
+def duplicate_instance_notifications_are_enabled() -> bool:
+    return env_bool("DUPLICATE_INSTANCE_NOTIFICATIONS_ENABLED", True)
+
+
+def ai_summary_dry_run_call_api_enabled() -> bool:
+    return env_bool("AI_SUMMARY_DRY_RUN_CALL_API", False)
+
+
+def ai_summary_in_digest_enabled() -> bool:
+    return env_bool("AI_SUMMARY_IN_DIGEST", True)
+
+
 def default_single_instance_lock_path() -> Path:
     script_path = Path(__file__).resolve()
     lock_suffix = hashlib.sha1(script_path.as_posix().encode("utf-8")).hexdigest()[:16]
     return Path(tempfile.gettempdir()) / f"changelog-watch-telegram-bot-{lock_suffix}.lock"
+
+
+def resolve_instance_lock_path(lock_path: str | None = None) -> Path:
+    configured_path = (lock_path or "").strip()
+    if not configured_path:
+        return default_single_instance_lock_path()
+
+    path = Path(configured_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
 
 
 def read_single_instance_lock_pid(lock_path: Path) -> int | None:
@@ -113,7 +183,7 @@ def acquire_single_instance_lock(lock_path: str | None = None) -> tuple[bool, in
     if _single_instance_lock_fd is not None:
         return True, os.getpid()
 
-    path = Path(lock_path) if lock_path else default_single_instance_lock_path()
+    path = resolve_instance_lock_path(lock_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
@@ -161,7 +231,9 @@ def release_single_instance_lock() -> None:
 
 
 def load_admin_ids_for_lock_alert(routing_config_path: str | None) -> set[str]:
-    path = routing_config_path or os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+    path = routing_config_path or get_routing_config_path()
+    if not path:
+        return set()
     try:
         routing_data = load_routing_yaml(path)
     except Exception:
@@ -184,7 +256,7 @@ def load_admin_ids_for_lock_alert(routing_config_path: str | None) -> set[str]:
 
 
 def _instance_alert_state_file(kind: str, lock_path: str | None = None) -> Path:
-    base_path = Path(lock_path) if lock_path else default_single_instance_lock_path()
+    base_path = resolve_instance_lock_path(lock_path)
     return base_path.parent / f"{base_path.name}.{kind}.alert"
 
 
@@ -218,11 +290,11 @@ def _should_send_alert_with_cooldown(state_file: Path, marker: str, *, cooldown_
 
 async def notify_single_instance_lock_conflict(
     telegram_token: str,
-    routing_config_path: str,
+    routing_config_path: str | None,
     lock_owner_pid: int | None,
     lock_path: str | None = None,
 ) -> None:
-    admin_ids = load_admin_ids_for_lock_alert(routing_config_path)
+    admin_ids = load_admin_ids_for_notifications(routing_config_path)
     if not telegram_token or not admin_ids:
         return
 
@@ -307,6 +379,10 @@ class SummarySchedule:
     def immediate(cls) -> "SummarySchedule":
         return cls(mode="immediate", time="00:00", weekday=None)
 
+    @classmethod
+    def disabled(cls) -> "SummarySchedule":
+        return cls(mode="none", time="00:00", weekday=None)
+
 
 def normalize_alias(value: Any) -> str | None:
     alias = normalize_string(value)
@@ -369,7 +445,8 @@ class ChatRouting:
     enabled: bool = True
     send_summary: bool = True
     delivery_mode: str = "both"
-    summary_schedule: SummarySchedule = field(default_factory=SummarySchedule.immediate)
+    summary_schedule: SummarySchedule = field(default_factory=SummarySchedule.disabled)
+    summary_on_startup: bool = False
     last_summary_sent_at: str | None = None
 
 
@@ -393,6 +470,7 @@ class RoutingState:
     db_path: str
     ttl_seconds: int = 0
     source_config_path: str | None = None
+    dry_run: bool = False
     config: RoutingConfig | None = None
     loaded_at_monotonic: float | None = None
 
@@ -415,7 +493,7 @@ class RoutingState:
         return self.config
 
     def _reload(self, source_ids: set[str], *, reason: str) -> RoutingConfig:
-        with db_connect(self.db_path) as conn:
+        with db_connect_runtime(self.db_path, dry_run=self.dry_run) as conn:
             ensure_routing_state_seeded(conn, self.source_config_path, source_ids)
             config = load_routing_config_from_db(conn, source_ids)
         self.config = config
@@ -485,15 +563,30 @@ def ensure_routing_state_seeded(
     source_config_path: str | None,
     source_ids: set[str],
 ) -> None:
+    seed_mode = get_routing_seed_mode()
+    has_routing_data = routing_has_data(conn)
+
+    if seed_mode == "off":
+        if not has_routing_data:
+            raise RuntimeError("ROUTING_SEED_MODE=off and routing DB is empty; import routing config manually first")
+        return
+
+    if seed_mode == "once" and has_routing_data:
+        return
+
+    if source_config_path is None and seed_mode == "sync":
+        raise RuntimeError("ROUTING_SEED_MODE=sync requires ROUTING_CONFIG_PATH")
+
     if source_config_path is None:
-        raise RuntimeError("routing state is empty and ROUTING_CONFIG_PATH is not set")
+        raise RuntimeError(
+            "ROUTING_CONFIG_PATH is not set and routing DB is empty. "
+            "Copy admin-routing.example.yaml to admin-routing.yaml or set ROUTING_CONFIG_PATH."
+        )
 
     source_path = Path(source_config_path)
     if not source_path.exists():
         raise RuntimeError(f"routing seed file not found: {source_config_path}")
 
-    # Keep routing admins/chats in sync with seed config while preserving
-    # runtime changes (e.g. /subscribe) stored in SQLite.
     route_config = load_routing_config(source_path, source_ids)
     import_routing_config_to_db(conn, route_config)
 
@@ -528,9 +621,9 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
             """
             INSERT INTO routing_chats(
                 chat_id, title, enabled, send_summary, delivery_mode, alias,
-                summary_mode, summary_time, summary_weekday
+                summary_mode, summary_time, summary_weekday, summary_on_startup
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
                 enabled = excluded.enabled,
@@ -539,7 +632,8 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
                 alias = excluded.alias,
                 summary_mode = excluded.summary_mode,
                 summary_time = excluded.summary_time,
-                summary_weekday = excluded.summary_weekday
+                summary_weekday = excluded.summary_weekday,
+                summary_on_startup = excluded.summary_on_startup
             """,
             (
                 chat.chat_id,
@@ -551,6 +645,7 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
                 chat.summary_schedule.mode,
                 chat.summary_schedule.time,
                 chat.summary_schedule.weekday,
+                int(chat.summary_on_startup),
             ),
         )
 
@@ -579,7 +674,11 @@ def apply_chat_subscription_change_db(
 ) -> str:
     if add:
         conn.execute(
-            "INSERT OR IGNORE INTO routing_chats(chat_id, title, enabled, send_summary) VALUES (?, ?, 1, 1)",
+            """
+            INSERT OR IGNORE INTO routing_chats(
+                chat_id, title, enabled, send_summary, delivery_mode, summary_mode, summary_on_startup
+            ) VALUES (?, ?, 1, 0, 'instant', 'none', 0)
+            """,
             (chat_id, chat_title or None),
         )
         if chat_title:
@@ -722,16 +821,16 @@ def parse_weekday(raw_weekday: Any, context: str) -> int:
 
 def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
     if raw_schedule is None:
-        return SummarySchedule.immediate()
+        return SummarySchedule.disabled()
 
     if isinstance(raw_schedule, str):
         mode = normalize_string(raw_schedule).lower()
         if not mode:
-            return SummarySchedule.immediate()
+            return SummarySchedule.disabled()
         if mode not in {"immediate", "on", "enabled", "true", "none"}:
             raise ValueError(f"{context} summary schedule mode is invalid: {mode!r}")
         if mode == "none":
-            return SummarySchedule(mode="none", time="00:00", weekday=None)
+            return SummarySchedule.disabled()
         return SummarySchedule.immediate()
 
     if not isinstance(raw_schedule, dict):
@@ -739,7 +838,7 @@ def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
 
     mode = normalize_string(raw_schedule.get("mode") or raw_schedule.get("kind") or raw_schedule.get("frequency"))
     if not mode:
-        mode = "immediate"
+        mode = "none"
     mode = mode.lower()
     if mode not in {"immediate", "daily", "weekly", "none"}:
         raise ValueError(f"{context} summary_schedule.mode must be one of immediate|daily|weekly|none: {mode!r}")
@@ -747,7 +846,7 @@ def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
     if mode == "immediate":
         return SummarySchedule.immediate()
     if mode == "none":
-        return SummarySchedule(mode="none", time="00:00", weekday=None)
+        return SummarySchedule.disabled()
 
     hour, minute = validate_summary_time(
         raw_schedule.get("time") or raw_schedule.get("at"),
@@ -763,31 +862,85 @@ def parse_summary_schedule(raw_schedule: Any, context: str) -> SummarySchedule:
 
 
 def parse_summary_schedule_from_db(row: sqlite3.Row, chat_id: str) -> SummarySchedule:
-    summary_mode = normalize_string(row["summary_mode"]) if "summary_mode" in row.keys() else "immediate"
+    summary_mode = normalize_string(row["summary_mode"]) if "summary_mode" in row.keys() else "none"
     summary_time = normalize_string(row["summary_time"]) if "summary_time" in row.keys() else "00:00"
     weekday = row["summary_weekday"] if "summary_weekday" in row.keys() else None
 
     try:
         return parse_summary_schedule(
             {
-                "mode": summary_mode or "immediate",
+                "mode": summary_mode or "none",
                 "time": summary_time,
                 "weekday": weekday,
             },
             f"chat {chat_id}",
         )
     except ValueError as exc:
-        LOG.warning("chat %s has invalid summary schedule in DB, fallback to immediate: %s", chat_id, exc)
-        return SummarySchedule.immediate()
+        LOG.warning("chat %s has invalid summary schedule in DB, fallback to none: %s", chat_id, exc)
+        return SummarySchedule.disabled()
 
 
 def parse_sqlite_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def current_summary_schedule_boundary(schedule: SummarySchedule, now: datetime) -> datetime | None:
+    if schedule.mode not in {"daily", "weekly"}:
+        return None
+
+    parsed_time = SUMMARY_TIME_RE.match(schedule.time)
+    if not parsed_time:
+        return None
+
+    hour = int(parsed_time.group("hour"))
+    minute = int(parsed_time.group("minute"))
+
+    if schedule.mode == "daily":
+        scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now < scheduled_dt:
+            scheduled_dt -= timedelta(days=1)
+        return scheduled_dt
+
+    if schedule.weekday is None or schedule.weekday != now.weekday():
+        return None
+
+    scheduled_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now < scheduled_dt:
+        return None
+    return scheduled_dt
+
+
+def should_suppress_summary_on_startup(
+    chat: ChatRouting,
+    now: datetime,
+    started_at: datetime | None,
+) -> tuple[bool, datetime | None]:
+    if chat.summary_on_startup or started_at is None:
+        return False, None
+    if chat.summary_schedule.mode in {"none", "immediate"}:
+        return False, None
+
+    boundary = current_summary_schedule_boundary(chat.summary_schedule, now)
+    if boundary is None:
+        return False, None
+
+    started_at_local = started_at.astimezone(now.tzinfo) if now.tzinfo else started_at
+    if started_at_local <= boundary:
+        return False, None
+
+    last_sent_at = parse_sqlite_datetime(chat.last_summary_sent_at)
+    if last_sent_at is not None and last_sent_at.astimezone(boundary.tzinfo) >= boundary:
+        return False, None
+
+    return True, boundary
 
 
 def is_summary_due(schedule: SummarySchedule, now: datetime, last_sent_at: str | None) -> bool:
@@ -931,8 +1084,13 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
 
         title = normalize_string(raw_chat.get("title")) or None
         alias = normalize_alias(raw_chat.get("alias"))
-        enabled = bool(raw_chat.get("enabled", True))
-        send_summary = bool(raw_chat.get("send_summary", True))
+        enabled = parse_bool_value(raw_chat.get("enabled"), f"chats[{idx}].enabled", default=True)
+        send_summary = parse_bool_value(raw_chat.get("send_summary"), f"chats[{idx}].send_summary", default=True)
+        summary_on_startup = parse_bool_value(
+            raw_chat.get("summary_on_startup"),
+            f"chats[{idx}].summary_on_startup",
+            default=False,
+        )
         summary_schedule = parse_summary_schedule(raw_chat.get("summary_schedule"), f"chats[{idx}]")
         delivery_mode = parse_delivery_mode(raw_chat.get("delivery_mode"), f"chats[{idx}]", send_summary=send_summary)
 
@@ -953,6 +1111,7 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
             send_summary=send_summary,
             delivery_mode=delivery_mode,
             summary_schedule=summary_schedule,
+            summary_on_startup=summary_on_startup,
         )
 
     return RoutingConfig(admins=admins, admin_aliases=admin_aliases, source_groups=source_groups, chats=chats)
@@ -1030,6 +1189,7 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
         )
         alias = normalize_alias(raw_chat["alias"]) if raw_chat["alias"] is not None else None
         summary_schedule = parse_summary_schedule_from_db(raw_chat, chat_id)
+        summary_on_startup = bool(raw_chat["summary_on_startup"]) if "summary_on_startup" in raw_chat.keys() else False
         last_summary_sent_at = normalize_string(raw_chat["last_summary_sent_at"]) or None
 
         for existing_chat in chats.values():
@@ -1049,6 +1209,7 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
             send_summary=send_summary,
             delivery_mode=delivery_mode,
             summary_schedule=summary_schedule,
+            summary_on_startup=summary_on_startup,
             last_summary_sent_at=last_summary_sent_at,
         )
 
@@ -1110,13 +1271,15 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
     if "alias" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN alias TEXT")
     if "summary_mode" not in chat_columns:
-        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_mode TEXT NOT NULL DEFAULT 'immediate'")
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_mode TEXT NOT NULL DEFAULT 'none'")
     if "summary_time" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_time TEXT NOT NULL DEFAULT '00:00'")
     if "summary_weekday" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_weekday INTEGER")
     if "last_summary_sent_at" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN last_summary_sent_at TEXT")
+    if "summary_on_startup" not in chat_columns:
+        conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_on_startup INTEGER NOT NULL DEFAULT 0")
     delivery_mode_added = "delivery_mode" not in chat_columns
 
     if delivery_mode_added:
@@ -1172,11 +1335,7 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_queue_chat_id ON summary_queue(chat_id)")
 
 
-def db_connect(db_path: str | Path) -> sqlite3.Connection:
-    path = Path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
+def initialize_database_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(
         """
@@ -1221,9 +1380,10 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
             send_summary INTEGER NOT NULL DEFAULT 1,
             alias TEXT,
             delivery_mode TEXT NOT NULL DEFAULT 'both',
-            summary_mode TEXT NOT NULL DEFAULT 'immediate',
+            summary_mode TEXT NOT NULL DEFAULT 'none',
             summary_time TEXT NOT NULL DEFAULT '00:00',
             summary_weekday INTEGER,
+            summary_on_startup INTEGER NOT NULL DEFAULT 0,
             last_summary_sent_at TEXT
         )
         """
@@ -1276,7 +1436,40 @@ def db_connect(db_path: str | Path) -> sqlite3.Connection:
 
     ensure_routing_columns(conn)
     conn.commit()
+
+
+def db_connect(db_path: str | Path) -> sqlite3.Connection:
+    if str(db_path) == ":memory:":
+        conn = sqlite3.connect(":memory:")
+    else:
+        path = Path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    initialize_database_schema(conn)
     return conn
+
+
+def db_connect_for_dry_run(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+
+    path = Path(db_path)
+    if path.exists():
+        source_conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            source_conn.backup(conn)
+        finally:
+            source_conn.close()
+
+    initialize_database_schema(conn)
+    return conn
+
+
+def db_connect_runtime(db_path: str | Path, *, dry_run: bool) -> sqlite3.Connection:
+    if dry_run:
+        return db_connect_for_dry_run(db_path)
+    return db_connect(db_path)
 
 
 def is_source_initialized(conn: sqlite3.Connection, source_id: str) -> bool:
@@ -1585,6 +1778,9 @@ async def get_or_generate_ai_summary(
     if cached:
         return cached
 
+    if dry_run and not ai_summary_dry_run_call_api_enabled():
+        return None
+
     summary = await generate_ai_summary(client, source, entry)
     if summary and not dry_run:
         save_ai_summary(conn, source["id"], entry.item_id, model, target_language, summary)
@@ -1698,13 +1894,30 @@ def enqueue_summary_items(
     conn.commit()
 
 
+def get_summary_queue_max_age() -> timedelta | None:
+    raw_value = os.getenv("SUMMARY_QUEUE_MAX_AGE_DAYS", "").strip()
+    if not raw_value:
+        return None
+    try:
+        days = int(raw_value)
+    except ValueError:
+        LOG.warning("SUMMARY_QUEUE_MAX_AGE_DAYS must be a positive integer; stale queue filtering disabled")
+        return None
+    if days <= 0:
+        LOG.warning("SUMMARY_QUEUE_MAX_AGE_DAYS must be greater than zero; stale queue filtering disabled")
+        return None
+    return timedelta(days=days)
+
+
 def load_summary_queue_items(
     conn: sqlite3.Connection,
     chat_id: str,
 ) -> list[tuple[str, ChangelogEntry]]:
+    max_age = get_summary_queue_max_age()
+    cutoff = datetime.now(timezone.utc) - max_age if max_age is not None else None
     rows = conn.execute(
         """
-        SELECT source_id, item_id, item_title, item_version, item_date, item_url, item_is_prerelease
+        SELECT source_id, item_id, item_title, item_version, item_date, item_url, item_is_prerelease, created_at
         FROM summary_queue
         WHERE chat_id = ?
         ORDER BY created_at, rowid
@@ -1713,7 +1926,13 @@ def load_summary_queue_items(
     ).fetchall()
 
     result: list[tuple[str, ChangelogEntry]] = []
+    skipped_stale = 0
     for row in rows:
+        created_at = parse_sqlite_datetime(row["created_at"])
+        if cutoff is not None and created_at is not None and created_at < cutoff:
+            skipped_stale += 1
+            continue
+
         result.append(
             (
                 row["source_id"],
@@ -1728,11 +1947,23 @@ def load_summary_queue_items(
                 ),
             )
         )
+    if skipped_stale:
+        LOG.warning("summary queue for chat %s skipped %d stale item(s)", chat_id, skipped_stale)
     return result
 
 
 def clear_summary_queue(conn: sqlite3.Connection, chat_id: str) -> None:
     conn.execute("DELETE FROM summary_queue WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+
+
+def clear_summary_queue_items(conn: sqlite3.Connection, chat_id: str, entries: list[tuple[str, ChangelogEntry]]) -> None:
+    if not entries:
+        return
+    conn.executemany(
+        "DELETE FROM summary_queue WHERE chat_id = ? AND source_id = ? AND item_id = ?",
+        [(chat_id, source_id, entry.item_id) for source_id, entry in entries],
+    )
     conn.commit()
 
 
@@ -2112,6 +2343,10 @@ def format_summary_entry(
     return "\n".join(lines)
 
 
+def should_include_ai_summary_in_digest() -> bool:
+    return ai_summary_enabled() and ai_summary_in_digest_enabled()
+
+
 async def build_aggregate_summary(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
@@ -2120,14 +2355,17 @@ async def build_aggregate_summary(
     dry_run: bool,
 ) -> str:
     lines: list[str] = ["📌 <b>Сводка новых релизов</b>"]
+    include_ai_summary = should_include_ai_summary_in_digest()
     for source, entry in entries:
-        ai_summary = await get_or_generate_ai_summary(
-            conn,
-            client,
-            source,
-            entry,
-            dry_run=dry_run,
-        )
+        ai_summary = None
+        if include_ai_summary:
+            ai_summary = await get_or_generate_ai_summary(
+                conn,
+                client,
+                source,
+                entry,
+                dry_run=dry_run,
+            )
         lines.append("")
         lines.append(format_summary_entry(source, entry, ai_summary))
     return "\n".join(lines)
@@ -2600,6 +2838,25 @@ async def send_summaries(
         await send_summary(client, telegram_token, chat_id, entries, conn, dry_run)
 
 
+def finalize_sent_summary_queue(
+    conn: sqlite3.Connection,
+    chat: ChatRouting,
+    queued: list[tuple[str, ChangelogEntry]],
+    sent_at: datetime,
+) -> None:
+    clear_summary_queue_items(conn, chat.chat_id, queued)
+    for source_id, entry in queued:
+        mark_delivery_status(
+            conn,
+            source_id,
+            entry.item_id,
+            chat.chat_id,
+            sent=True,
+        )
+    if chat.summary_schedule.mode != "immediate":
+        mark_chat_summary_sent(conn, chat.chat_id, sent_at)
+
+
 async def check_all(
     config_path: str,
     db_path: str,
@@ -2607,11 +2864,12 @@ async def check_all(
     routing_state: RoutingState | None = None,
     force_routing_reload: bool = False,
     lock_path: str | None = None,
+    started_at: datetime | None = None,
 ) -> None:
     load_dotenv()
     config = load_config(config_path)
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
+    routing_config_path = get_routing_config_path()
     routing_sources = config["sources"]
     source_ids = collect_source_ids(routing_sources)
     if routing_state is None:
@@ -2619,6 +2877,7 @@ async def check_all(
             db_path=db_path,
             source_config_path=routing_config_path,
             ttl_seconds=0,
+            dry_run=dry_run,
         )
 
     routing = routing_state.get(source_ids, force_reload=force_routing_reload)
@@ -2640,14 +2899,15 @@ async def check_all(
     schedule_now = now.astimezone(schedule_tz)
     accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
-    conn = db_connect(db_path)
+    conn = db_connect_runtime(db_path, dry_run=dry_run)
     headers = {
         "User-Agent": "changelog-watch-telegram-bot/1.0",
         "Accept": "text/html,text/markdown,text/plain,application/json,*/*",
     }
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
-        if not dry_run:
-            await notify_if_multiple_instances(client, telegram_token, routing.admins, lock_path=lock_path)
+        if not dry_run and duplicate_instance_notifications_are_enabled():
+            duplicate_admin_ids = _load_admin_ids_from_env() or routing.admins
+            await notify_if_multiple_instances(client, telegram_token, duplicate_admin_ids, lock_path=lock_path)
 
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
@@ -2764,11 +3024,27 @@ async def check_all(
 
             summary_sent = False
             if should_send_summary and entries_for_chat:
-                if chat.summary_schedule.mode == "immediate" or is_summary_due(
+                summary_due = chat.summary_schedule.mode == "immediate" or is_summary_due(
                     chat.summary_schedule,
                     schedule_now,
                     chat.last_summary_sent_at,
-                ):
+                )
+                if summary_due:
+                    suppress_summary, suppressed_boundary = should_suppress_summary_on_startup(
+                        chat,
+                        schedule_now,
+                        started_at,
+                    )
+                    if suppress_summary:
+                        LOG.info(
+                            "summary for chat %s suppressed on startup until next schedule boundary",
+                            chat.chat_id,
+                        )
+                        if not dry_run and suppressed_boundary is not None:
+                            mark_chat_summary_sent(conn, chat.chat_id, suppressed_boundary)
+                        summary_due = False
+
+                if summary_due:
                     try:
                         summary_sent = await send_summary(
                             client,
@@ -2784,6 +3060,8 @@ async def check_all(
             finalize_summary_queue = summary_sent and not dry_run
 
             if chat.delivery_mode not in {"instant", "both"}:
+                if finalize_summary_queue:
+                    finalize_sent_summary_queue(conn, chat, queued, now)
                 continue
 
             for source, entry in instant_posts_by_chat.get(chat.chat_id, []):
@@ -2825,21 +3103,17 @@ async def check_all(
                     LOG.exception("[%s] failed to post %s to %s", source["id"], entry.item_id, chat.chat_id)
 
             if finalize_summary_queue:
-                clear_summary_queue(conn, chat.chat_id)
-                for source_id, entry in queued:
-                    mark_delivery_status(
-                        conn,
-                        source_id,
-                        entry.item_id,
-                        chat.chat_id,
-                        sent=True,
-                    )
-                if chat.summary_schedule.mode != "immediate":
-                    mark_chat_summary_sent(conn, chat.chat_id, now)
+                finalize_sent_summary_queue(conn, chat, queued, now)
     conn.close()
 
 
-async def run_scheduler(config_path: str, db_path: str, dry_run: bool, lock_path: str | None = None) -> None:
+async def run_scheduler(
+    config_path: str,
+    db_path: str,
+    dry_run: bool,
+    lock_path: str | None = None,
+    started_at: datetime | None = None,
+) -> None:
     config = load_config(config_path)
     poll_minutes = int(config.get("poll_minutes", 30))
     poll_seconds = max(1, poll_minutes * 60)
@@ -2850,8 +3124,9 @@ async def run_scheduler(config_path: str, db_path: str, dry_run: bool, lock_path
 
     routing_state = RoutingState(
         db_path=db_path,
-        source_config_path=os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml"),
+        source_config_path=get_routing_config_path(),
         ttl_seconds=routing_ttl_seconds,
+        dry_run=dry_run,
     )
 
     loop = asyncio.get_running_loop()
@@ -2910,6 +3185,7 @@ async def run_scheduler(config_path: str, db_path: str, dry_run: bool, lock_path
                     routing_state=routing_state,
                     force_routing_reload=force,
                     lock_path=lock_path,
+                    started_at=started_at,
                 )
             except Exception:
                 LOG.exception("cycle failed")
@@ -2939,12 +3215,78 @@ async def run_scheduler(config_path: str, db_path: str, dry_run: bool, lock_path
                 pass
 
 
+def validate_source_config(config: dict[str, Any]) -> set[str]:
+    sources = config["sources"]
+    source_ids = collect_source_ids(sources)
+    supported_types = {"html_changelog", "markdown_changelog", "github_releases"}
+
+    for source in sources:
+        source_id = source["id"]
+        source_type = normalize_string(source.get("type"))
+        if source_type not in supported_types:
+            raise ValueError(f"source {source_id} has unsupported type: {source_type!r}")
+
+        source_url = normalize_string(source.get("url"))
+        if not source_url:
+            raise ValueError(f"source {source_id} must define url")
+
+        if source_type == "github_releases":
+            github_repo_from_url(source_url)
+
+    return source_ids
+
+
+def validate_config_files(config_path: str, db_path: str) -> None:
+    errors: list[str] = []
+    source_ids: set[str] = set()
+
+    try:
+        config = load_config(config_path)
+        source_ids = validate_source_config(config)
+    except Exception as exc:
+        errors.append(f"products config: {exc}")
+
+    try:
+        get_routing_seed_mode()
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        with db_connect(db_path) as conn:
+            routing_config_path = get_routing_config_path()
+            if routing_config_path:
+                load_routing_config(routing_config_path, source_ids)
+            elif routing_has_data(conn):
+                load_routing_config_from_db(conn, source_ids)
+            else:
+                errors.append(
+                    "ROUTING_CONFIG_PATH is not set and routing DB is empty. "
+                    "Copy admin-routing.example.yaml to admin-routing.yaml or set ROUTING_CONFIG_PATH."
+                )
+    except Exception as exc:
+        errors.append(f"routing/DB validation: {exc}")
+
+    if errors:
+        raise RuntimeError("config validation failed:\n- " + "\n- ".join(errors))
+
+    LOG.info("config validation passed")
+
+
+def warn_legacy_telegram_chat_id() -> None:
+    if env_text("TELEGRAM_CHAT_ID"):
+        LOG.warning(
+            "TELEGRAM_CHAT_ID is legacy and ignored by routing mode. "
+            "Add this chat_id to admin-routing.yaml."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Telegram changelog watcher")
     parser.add_argument("--config", default=os.getenv("CONFIG_PATH", "products.yaml"))
     parser.add_argument("--db", default=os.getenv("DB_PATH", "data/posted.sqlite3"))
     parser.add_argument("--once", action="store_true", help="Run one check and exit")
     parser.add_argument("--dry-run", action="store_true", help="Do not send Telegram messages; log what would be posted")
+    parser.add_argument("--validate-config", action="store_true", help="Validate local config and DB schema without network calls")
     return parser.parse_args()
 
 
@@ -2952,11 +3294,17 @@ def main() -> None:
     load_dotenv()
     setup_logging()
     args = parse_args()
-    lock_path = os.getenv("BOT_INSTANCE_LOCK_PATH")
+    warn_legacy_telegram_chat_id()
+    if args.validate_config:
+        validate_config_files(args.config, args.db)
+        return
+
+    lock_path = env_text("BOT_INSTANCE_LOCK_PATH")
     lock_held = False
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
-    lifecycle_notifications_enabled = False
+    routing_config_path = get_routing_config_path()
+    lifecycle_notifications_enabled = lifecycle_notifications_are_enabled()
+    lifecycle_notifications_active = False
     startup_at = datetime.now(timezone.utc)
     lifecycle_error: BaseException | None = None
 
@@ -2967,8 +3315,8 @@ def main() -> None:
             LOG.error("single-instance lock is already held; another bot instance is running (pid=%s)", message_owner)
             try:
                 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-                routing_config_path = os.getenv("ROUTING_CONFIG_PATH", "admin-routing.yaml")
-                if telegram_token:
+                routing_config_path = get_routing_config_path()
+                if telegram_token and duplicate_instance_notifications_are_enabled():
                     asyncio.run(
                         notify_single_instance_lock_conflict(
                             telegram_token=telegram_token,
@@ -2982,7 +3330,7 @@ def main() -> None:
             return
         lock_held = True
 
-    if not args.dry_run and not startup_at is None:
+    if not args.dry_run and lifecycle_notifications_enabled:
         try:
             mode = "--once" if args.once else "continuous"
             startup_message = (
@@ -3000,20 +3348,20 @@ def main() -> None:
                     message=startup_message,
                 )
             )
-            lifecycle_notifications_enabled = bool(telegram_token and load_admin_ids_for_notifications(routing_config_path))
+            lifecycle_notifications_active = bool(telegram_token and load_admin_ids_for_notifications(routing_config_path))
         except Exception:
             LOG.exception("failed to send bot startup admin notification")
 
     try:
         if args.once:
-            asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path))
+            asyncio.run(check_all(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path, started_at=startup_at))
         else:
-            asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path))
+            asyncio.run(run_scheduler(args.config, args.db, dry_run=args.dry_run, lock_path=lock_path, started_at=startup_at))
     except BaseException as exc:
         lifecycle_error = exc
         raise
     finally:
-        if lifecycle_notifications_enabled and not args.dry_run:
+        if lifecycle_notifications_active and not args.dry_run:
             stopped_at = datetime.now(timezone.utc)
             elapsed_seconds = max(0.0, (stopped_at - startup_at).total_seconds())
 

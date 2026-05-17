@@ -27,6 +27,7 @@ chats:
     enabled: true
     send_summary: true
     delivery_mode: instant
+    summary_on_startup: false
     summary_schedule:
       mode: none
 
@@ -39,6 +40,7 @@ chats:
     enabled: true
     send_summary: false
     delivery_mode: digest
+    summary_on_startup: false
     summary_schedule:
       mode: weekly
       time: "20:00"

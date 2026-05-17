@@ -88,15 +88,27 @@ resolve_lock_file() {
     local script_abs
     local lock_suffix
 
+    normalize_lock_path() {
+        local raw_path="$1"
+        if [ -z "$raw_path" ]; then
+            return 1
+        fi
+        if [[ "$raw_path" == /* ]]; then
+            printf "%s\n" "$raw_path"
+        else
+            printf "%s/%s\n" "$REPO" "$raw_path"
+        fi
+    }
+
     if [ -n "$env_lock" ]; then
-        printf "%s\n" "$env_lock"
+        normalize_lock_path "$env_lock"
         return
     fi
 
     if [ -f "$env_file" ]; then
         repo_lock="$(sed -n 's/^[[:space:]]*BOT_INSTANCE_LOCK_PATH[[:space:]]*=//p' "$env_file" | tail -n1 | tr -d '\r' | tr -d '[:space:]' | tr -d '"' | tr -d "'")"
         if [ -n "$repo_lock" ]; then
-            printf "%s\n" "$repo_lock"
+            normalize_lock_path "$repo_lock"
             return
         fi
     fi
