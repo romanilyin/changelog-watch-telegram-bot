@@ -62,19 +62,18 @@ if ($CheckOnce) {
     }
 
     $repoWslPath = Convert-ToWslPath $WindowsRepoPath
-    $repoWslPathForBash = $repoWslPath -replace "'", "'\"'\"'"
-    $precheckScriptTemplate = @'
-cd '__REPO__'
+    $precheckScript = @'
+repo_path="${1:?repo path is required}"
+cd "$repo_path"
 python_bin="${VENV_PYTHON:-$PWD/.venv/bin/python}"
 if [ ! -x "$python_bin" ]; then
     python_bin="$(command -v python3 || command -v python)"
 fi
 "$python_bin" bot.py --once --dry-run
 '@
-    $precheckScript = $precheckScriptTemplate.Replace("__REPO__", $repoWslPathForBash)
 
     Write-Host "[restart] running dry-run precheck..." -ForegroundColor Cyan
-    Invoke-WslBot -Arguments @("--", "bash", "-lc", $precheckScript)
+    Invoke-WslBot -Arguments @("--", "bash", "-c", $precheckScript, "--", $repoWslPath)
     $precheckExitCode = $LASTEXITCODE
 
     if ($precheckExitCode -ne 0) {
