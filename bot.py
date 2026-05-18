@@ -84,6 +84,37 @@ _duplicate_instances_alert_sent = False
 _single_instance_lock_fd: int | None = None
 _single_instance_lock_path: Path | None = None
 _DUPLICATE_INSTANCE_ALERT_COOLDOWN_SECONDS = 60
+_TELEGRAM_BOT_TOKEN_IN_URL_RE = re.compile(r"/bot(?P<bot_id>\d+):(?P<secret>[^/\s\"']+)")
+
+
+def mask_telegram_bot_token(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        bot_id = match.group("bot_id")
+        visible_digits = bot_id[-4:] if len(bot_id) > 4 else bot_id
+        return f"/bot***{visible_digits}:<redacted>"
+
+    return _TELEGRAM_BOT_TOKEN_IN_URL_RE.sub(replace, text)
+
+
+class SecretMaskingLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = mask_telegram_bot_token(record.msg)
+        if record.args:
+            record.args = self._mask_args(record.args)
+        return True
+
+    def _mask_args(self, args: Any) -> Any:
+        if isinstance(args, tuple):
+            return tuple(self._mask_args(arg) for arg in args)
+        if isinstance(args, dict):
+            return {key: self._mask_args(value) for key, value in args.items()}
+        if isinstance(args, str):
+            return mask_telegram_bot_token(args)
+        text = str(args)
+        if "/bot" in text:
+            return mask_telegram_bot_token(text)
+        return args
 
 
 def env_text(name: str) -> str | None:
@@ -747,6 +778,9 @@ def setup_logging() -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger().addFilter(SecretMaskingLogFilter())
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(SecretMaskingLogFilter())
 
 
 def load_yaml_file(path: str | Path) -> dict[str, Any]:
@@ -1748,17 +1782,45 @@ async def generate_ai_summary(
         ],
     }
 
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.post(
+                f"{api_base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code == 429 and attempt < max_attempts:
+                retry_after = exc.response.headers.get("Retry-After", "").strip()
+                try:
+                    delay = max(1.0, min(float(retry_after), 30.0)) if retry_after else float(2 ** attempt)
+                except ValueError:
+                    delay = float(2 ** attempt)
+                LOG.warning(
+                    "[%s] AI summary rate limited for %s, retrying in %.1fs (attempt %d/%d)",
+                    source["id"],
+                    entry.item_id,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                await asyncio.sleep(delay)
+                continue
+            LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
+            return None
+        except Exception:
+            LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
+            return None
+
     try:
-        response = await client.post(
-            f"{api_base}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
         data = response.json()
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -1782,6 +1844,13 @@ async def generate_ai_summary(
 
         summary = clean_one_line_summary(str(content), max_len=max_output_chars)
         if not summary:
+            raw_content = re.sub(r"\s+", " ", str(content)).strip()
+            LOG.warning(
+                "AI summary response for %s/%s has empty cleaned content; raw_content=%r",
+                source["id"],
+                entry.item_id,
+                truncate(raw_content, 200),
+            )
             return None
         return summary
     except Exception:
@@ -1796,21 +1865,32 @@ async def get_or_generate_ai_summary(
     entry: ChangelogEntry,
     *,
     dry_run: bool = False,
+    cycle_cache: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> str | None:
     if not ai_summary_enabled():
         return None
 
     _, model, target_language, _, _, _ = get_ai_summary_settings()
+    cache_key = (source["id"], entry.item_id, model, target_language)
+    if cycle_cache is not None and cache_key in cycle_cache:
+        return cycle_cache[cache_key]
+
     cached = load_ai_summary(conn, source["id"], entry.item_id, model, target_language)
     if cached:
+        if cycle_cache is not None:
+            cycle_cache[cache_key] = cached
         return cached
 
     if dry_run and not ai_summary_dry_run_call_api_enabled():
+        if cycle_cache is not None:
+            cycle_cache[cache_key] = None
         return None
 
     summary = await generate_ai_summary(client, source, entry)
     if summary and not dry_run:
         save_ai_summary(conn, source["id"], entry.item_id, model, target_language, summary)
+    if cycle_cache is not None:
+        cycle_cache[cache_key] = summary
 
     return summary
 
@@ -2396,6 +2476,7 @@ async def build_aggregate_summary(
     entries: list[tuple[dict[str, Any], ChangelogEntry]],
     *,
     dry_run: bool,
+    ai_summary_cycle_cache: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> str:
     lines: list[str] = ["📌 <b>Сводка новых релизов</b>"]
     include_ai_summary = should_include_ai_summary_in_digest()
@@ -2408,6 +2489,7 @@ async def build_aggregate_summary(
                 source,
                 entry,
                 dry_run=dry_run,
+                cycle_cache=ai_summary_cycle_cache,
             )
         lines.append("")
         lines.append(format_summary_entry(source, entry, ai_summary))
@@ -2854,11 +2936,18 @@ async def send_summary(
     entries: list[tuple[dict[str, Any], ChangelogEntry]],
     conn: sqlite3.Connection,
     dry_run: bool,
+    ai_summary_cycle_cache: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> bool:
     if not entries:
         return False
 
-    msg = await build_aggregate_summary(conn, client, entries, dry_run=dry_run)
+    msg = await build_aggregate_summary(
+        conn,
+        client,
+        entries,
+        dry_run=dry_run,
+        ai_summary_cycle_cache=ai_summary_cycle_cache,
+    )
     if dry_run:
         LOG.info("[summary] DRY RUN would post aggregate:")
         LOG.info("%s", msg)
@@ -2874,11 +2963,12 @@ async def send_summaries(
     entries_by_chat: dict[str, list[tuple[dict[str, Any], ChangelogEntry]]],
     conn: sqlite3.Connection,
     dry_run: bool,
+    ai_summary_cycle_cache: dict[tuple[str, str, str, str], str | None] | None = None,
 ) -> None:
     if not entries_by_chat:
         return
     for chat_id, entries in entries_by_chat.items():
-        await send_summary(client, telegram_token, chat_id, entries, conn, dry_run)
+        await send_summary(client, telegram_token, chat_id, entries, conn, dry_run, ai_summary_cycle_cache)
 
 
 def finalize_sent_summary_queue(
@@ -2954,6 +3044,7 @@ async def check_all(
 
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
+        ai_summary_cycle_cache: dict[tuple[str, str, str, str], str | None] = {}
 
         if not dry_run:
             chat_access = await validate_routing_chats(client, telegram_token, routing)
@@ -3096,6 +3187,7 @@ async def check_all(
                             entries_for_chat,
                             conn,
                             dry_run=dry_run,
+                            ai_summary_cycle_cache=ai_summary_cycle_cache,
                         )
                     except Exception:
                         LOG.exception("failed to send summary to %s", chat.chat_id)
@@ -3118,6 +3210,7 @@ async def check_all(
                     source,
                     entry,
                     dry_run=dry_run,
+                    cycle_cache=ai_summary_cycle_cache,
                 )
                 msg = format_message_with_ai_summary(source, entry, ai_summary)
                 if dry_run:
