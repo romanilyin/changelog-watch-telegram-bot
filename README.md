@@ -120,6 +120,7 @@ python bot.py --import-settings data/settings-backup.yaml --replace
 
 ## Документация
 
+- `docs/INSTALLATION.md` — подробная установка на Ubuntu, WSL Ubuntu и Windows 11, автозапуск и перенос настроек.
 - `docs/INSTALL_WSL.md` — полный setup в Windows + WSL.
 - `docs/PROCESS_MANAGEMENT.md` — start/stop/restart/status, singleton-lock, systemd.
 - `docs/CONFIG.md` — `.env`, `products.yaml`, routing, summaries, dry-run.
