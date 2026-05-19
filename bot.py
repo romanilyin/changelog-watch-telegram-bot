@@ -1628,13 +1628,18 @@ def get_ai_summary_settings() -> tuple[str, str, str, int, int, int]:
     if not api_base:
         api_base = "https://opencode.ai/zen/v1"
 
-    model = os.getenv("AI_SUMMARY_MODEL", "deepseek-v4-flash-free").strip() or "deepseek-v4-flash-free"
+    model = os.getenv("AI_SUMMARY_MODEL", "minimax-m2.5-free").strip() or "minimax-m2.5-free"
     target_language = os.getenv("AI_SUMMARY_TARGET_LANGUAGE", "ru").strip() or "ru"
     max_input_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_INPUT_CHARS"), 6000)
     timeout_seconds = _parse_ai_summary_int(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS"), 30)
     max_output_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_OUTPUT_CHARS"), 220)
 
     return api_base, model, target_language, max_input_chars, timeout_seconds, max_output_chars
+
+
+def get_ai_summary_max_tokens(max_output_chars: int) -> int:
+    default_tokens = max(max_output_chars * 6, 1000)
+    return _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_TOKENS"), default_tokens)
 
 
 def clean_one_line_summary(text: str, max_len: int = 220) -> str:
@@ -1651,6 +1656,14 @@ def clean_one_line_summary(text: str, max_len: int = 220) -> str:
         if lowered.startswith(prefix):
             text = text[len(prefix):].strip()
             break
+
+    version_prefix = re.match(
+        r"(?i)^(?:в\s+версии|версия)\s+v?\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?\s+",
+        text,
+    )
+    if version_prefix:
+        text = text[version_prefix.end():].strip()
+        text = text[:1].upper() + text[1:] if text else text
 
     banned_starts = (
         "в этом релизе ",
@@ -1758,7 +1771,7 @@ async def generate_ai_summary(
         "model": model,
         "stream": False,
         "temperature": 0.2,
-        "max_tokens": max(max_output_chars + 20, 60),
+        "max_tokens": get_ai_summary_max_tokens(max_output_chars),
         "messages": [
             {
                 "role": "system",
@@ -1832,6 +1845,8 @@ async def generate_ai_summary(
             LOG.warning("AI summary response for %s has invalid choice payload", source["id"])
             return None
 
+        finish_reason = first_choice.get("finish_reason")
+
         message = first_choice.get("message")
         if not isinstance(message, dict):
             LOG.warning("AI summary response for %s has invalid message payload", source["id"])
@@ -1839,7 +1854,13 @@ async def generate_ai_summary(
 
         content = message.get("content")
         if content is None:
-            LOG.warning("AI summary response for %s has empty content", source["id"])
+            LOG.warning(
+                "AI summary response for %s/%s has empty content; finish_reason=%r message_keys=%s",
+                source["id"],
+                entry.item_id,
+                finish_reason,
+                sorted(str(key) for key in message.keys()),
+            )
             return None
 
         summary = clean_one_line_summary(str(content), max_len=max_output_chars)
