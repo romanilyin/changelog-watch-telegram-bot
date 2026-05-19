@@ -1,0 +1,49 @@
+# Copy to scripts/model-summary-compare.local.yaml and fill keys there.
+# *.local.yaml is ignored by git.
+
+output: data/model-summary-comparison.md
+row_description_chars: 700
+
+items:
+  # Recent rows are selected from SQLite posted_items by default.
+  # If chat_id is set, rows are selected from deliveries for that chat.
+  limit: 5
+  source_ids: []
+  item_ids: []
+  # chat_id: -1001234567890
+
+defaults:
+  target_language: ru
+  max_input_chars: 6000
+  max_output_chars: 220
+  max_tokens: 1200
+  temperature: 0.2
+  timeout_seconds: 60
+  rpm: 10
+  max_attempts: 8
+  rate_limit_wait_seconds: 60
+
+models:
+  - name: zen-minimax-free
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: AI_SUMMARY_API_KEY
+    model: minimax-m2.5-free
+    rpm: 5
+    rate_limit_group: opencode-zen
+
+  - name: zen-deepseek-free
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: AI_SUMMARY_API_KEY
+    model: deepseek-v4-flash-free
+    rpm: 5
+    rate_limit_group: opencode-zen
+
+  # Example for another OpenAI-compatible provider.
+  # Put PROVIDER_API_KEY in your shell/.env or replace api_key_env with api_key
+  # in the local ignored config.
+  # - name: provider-model
+  #   api_base: https://api.provider.example/v1
+  #   api_key_env: PROVIDER_API_KEY
+  #   model: provider/model-id
+  #   rpm: 20
+  #   rate_limit_group: provider-account

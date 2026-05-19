@@ -7,3 +7,4 @@ data/
 docs/TEMP/
 admin-routing.yaml
 *.local.yaml
+*.local.env

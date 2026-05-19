@@ -55,3 +55,22 @@ AI_SUMMARY_IN_DIGEST=true
 ```
 
 Если поставить `false`, AI summary останутся только в instant posts. Это снижает риск медленной scheduled digest отправки, если AI API отвечает долго.
+
+## Model Comparison
+
+Для сравнения нескольких моделей есть отдельный скрипт:
+
+```bash
+cp scripts/model-summary-compare.example.yaml scripts/model-summary-compare.local.yaml
+python scripts/compare-model-summaries.py --models-config scripts/model-summary-compare.local.yaml --limit 5
+```
+
+Скрипт берёт recent release ids из SQLite (`posted_items`, либо `deliveries` при `chat_id`), восстанавливает release notes через источники из `products.yaml`, вызывает модели из отдельного YAML-конфига и пишет Markdown-таблицу. `*.local.yaml` игнорируется git, поэтому ключи держи там или через `api_key_env`. Для общего RPM-лимита провайдера укажи одинаковый `rate_limit_group` у нескольких моделей.
+
+Полезные режимы:
+
+```bash
+python scripts/compare-model-summaries.py --list-items --limit 10
+python scripts/compare-model-summaries.py --dry-run --models-config scripts/model-summary-compare.local.yaml
+python scripts/compare-model-summaries.py --item opencode_changelog:v1.15.5 --model zen-minimax-free
+```
