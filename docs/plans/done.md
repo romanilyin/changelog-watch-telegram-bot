@@ -39,4 +39,12 @@
 - `--replace` теперь применим к `--import-settings` и явно заменяет routing/settings tables.
 - Export/import ограничен routing/settings tables; runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state` не экспортируются.
 - Restore выполняется транзакционно после валидации YAML.
-- Следующая итерация: runtime sources in SQLite.
+
+## Iteration 2: Runtime Sources In SQLite
+
+- Добавлена SQLite-таблица `runtime_sources` для runtime source definitions с YAML config blob и timestamps.
+- `products.yaml` используется как seed для первого запуска и продолжает задавать `poll_minutes`.
+- Runtime, validation, scheduler и admin-command paths читают source ids/configs из SQLite после seed.
+- `--export-settings`/`--import-settings` теперь включают runtime sources вместе с routing settings.
+- `--import-settings --replace` заменяет source/routing settings транзакционно и не удаляет history/runtime tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state`.
+- Следующая итерация: Telegram read/list commands.

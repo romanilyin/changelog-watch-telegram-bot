@@ -57,10 +57,10 @@ Windows PowerShell 7 + WSL:
 ## Важные Файлы
 
 - `bot.py` — основной бот и CLI.
-- `products.yaml` — список источников.
+- `products.yaml` — seed/backup список источников и `poll_minutes`.
 - `admin-routing.yaml` — seed-файл routing-настроек.
 - `.env` — runtime-настройки.
-- `data/posted.sqlite3` — состояние публикаций, routing, очереди digest и AI cache.
+- `data/posted.sqlite3` — runtime sources, routing, состояние публикаций, очереди digest и AI cache.
 - `check-dry-run-no-write.sh` — ручная проверка, что dry-run не меняет SQLite.
 
 ## Настройки

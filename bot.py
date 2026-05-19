@@ -580,6 +580,84 @@ def load_source_ids(config_path: str | Path) -> set[str]:
     return collect_source_ids(config["sources"])
 
 
+def source_store_has_data(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT COUNT(*) FROM runtime_sources").fetchone()[0] > 0
+
+
+def source_config_to_yaml_text(source: dict[str, Any]) -> str:
+    return yaml.safe_dump(source, allow_unicode=True, sort_keys=False)
+
+
+def parse_source_config_text(source_id: str, config_text: str) -> dict[str, Any]:
+    source = yaml.safe_load(config_text) or {}
+    if not isinstance(source, dict):
+        raise ValueError(f"runtime source {source_id} config must be an object")
+    source["id"] = normalize_source_id(source.get("id", source_id))
+    if source["id"] != source_id:
+        raise ValueError(f"runtime source row id {source_id} does not match config id {source['id']}")
+    return source
+
+
+def load_sources_from_db(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for row in conn.execute("SELECT source_id, config_yaml FROM runtime_sources ORDER BY source_id").fetchall():
+        sources.append(parse_source_config_text(row["source_id"], row["config_yaml"]))
+    validate_source_config({"sources": sources})
+    return sources
+
+
+def import_sources_to_db(
+    conn: sqlite3.Connection,
+    sources: list[dict[str, Any]],
+    *,
+    replace: bool = False,
+    commit: bool = True,
+) -> None:
+    validate_source_config({"sources": sources})
+    if replace:
+        conn.execute("DELETE FROM runtime_sources")
+
+    now = datetime.now(timezone.utc).isoformat()
+    for source in sources:
+        source_id = source["id"]
+        config_text = source_config_to_yaml_text(source)
+        conn.execute(
+            """
+            INSERT INTO runtime_sources(source_id, config_yaml, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET
+                config_yaml = excluded.config_yaml,
+                updated_at = excluded.updated_at
+            """,
+            (source_id, config_text, now, now),
+        )
+
+    if commit:
+        conn.commit()
+
+
+def ensure_source_state_seeded(conn: sqlite3.Connection, config_path: str | Path) -> None:
+    if source_store_has_data(conn):
+        return
+    config = load_config(config_path)
+    validate_source_config(config)
+    import_sources_to_db(conn, config["sources"], replace=True)
+
+
+def load_runtime_config(conn: sqlite3.Connection, config_path: str | Path) -> dict[str, Any]:
+    seed_config = load_config(config_path)
+    ensure_source_state_seeded(conn, config_path)
+    runtime_config = dict(seed_config)
+    runtime_config["sources"] = load_sources_from_db(conn)
+    return runtime_config
+
+
+def load_runtime_source_ids(db_path: str | Path, config_path: str | Path) -> set[str]:
+    with db_connect(db_path) as conn:
+        ensure_source_state_seeded(conn, config_path)
+        return collect_source_ids(load_sources_from_db(conn))
+
+
 def load_routing_yaml(path: str | Path) -> dict[str, Any]:
     return load_yaml_file(path)
 
@@ -1087,9 +1165,7 @@ def resolve_chat_identifier(value: str, routing: RoutingConfig) -> str | None:
         return None
 
 
-def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig:
-    data = load_yaml_file(path)
-
+def load_routing_config_data(data: dict[str, Any], source_ids: set[str]) -> RoutingConfig:
     admins_raw = data.get("admins", [])
     if not isinstance(admins_raw, list):
         raise ValueError("routing config 'admins' must be a list")
@@ -1190,6 +1266,10 @@ def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig
         )
 
     return RoutingConfig(admins=admins, admin_aliases=admin_aliases, source_groups=source_groups, chats=chats)
+
+
+def load_routing_config(path: str | Path, source_ids: set[str]) -> RoutingConfig:
+    return load_routing_config_data(load_yaml_file(path), source_ids)
 
 
 def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) -> RoutingConfig:
@@ -1457,6 +1537,16 @@ def initialize_database_schema(conn: sqlite3.Connection) -> None:
             item_id TEXT NOT NULL,
             posted_at TEXT NOT NULL,
             PRIMARY KEY (source_id, item_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_sources (
+            source_id TEXT PRIMARY KEY,
+            config_yaml TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
         """
     )
@@ -2752,7 +2842,7 @@ async def run_admin_command_listener(
                     if command not in {"reload", "subscribe", "unsubscribe", "start", "help"}:
                         continue
 
-                    source_ids = load_source_ids(config_path)
+                    source_ids = load_runtime_source_ids(db_path, config_path)
                     routing = routing_state.get(source_ids)
                     if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
                         continue
@@ -3073,9 +3163,10 @@ async def check_all(
     started_at: datetime | None = None,
 ) -> None:
     load_dotenv()
-    config = load_config(config_path)
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     routing_config_path = get_routing_config_path()
+    conn = db_connect_runtime(db_path, dry_run=dry_run)
+    config = load_runtime_config(conn, config_path)
     routing_sources = config["sources"]
     source_ids = collect_source_ids(routing_sources)
     if routing_state is None:
@@ -3105,7 +3196,6 @@ async def check_all(
     schedule_now = now.astimezone(schedule_tz)
     accessible_chat_ids = {chat_id for chat_id in enabled_chat_ids}
 
-    conn = db_connect_runtime(db_path, dry_run=dry_run)
     headers = {
         "User-Agent": "changelog-watch-telegram-bot/1.0",
         "Accept": "text/html,text/markdown,text/plain,application/json,*/*",
@@ -3463,6 +3553,8 @@ def validate_config_files(config_path: str, db_path: str, *, migrate_db: bool = 
     try:
         db_factory = db_connect if migrate_db else db_connect_for_dry_run
         with db_factory(db_path) as conn:
+            ensure_source_state_seeded(conn, config_path)
+            source_ids = collect_source_ids(load_sources_from_db(conn))
             routing_config_path = get_routing_config_path()
             if routing_config_path:
                 load_routing_config(routing_config_path, source_ids)
@@ -3483,9 +3575,9 @@ def validate_config_files(config_path: str, db_path: str, *, migrate_db: bool = 
     LOG.info("config validation passed (%s)", migration_note)
 
 
-def load_validated_routing_seed(config_path: str) -> RoutingConfig:
-    config = load_config(config_path)
-    source_ids = validate_source_config(config)
+def load_validated_routing_seed(conn: sqlite3.Connection, config_path: str) -> RoutingConfig:
+    ensure_source_state_seeded(conn, config_path)
+    source_ids = collect_source_ids(load_sources_from_db(conn))
     routing_config_path = get_routing_config_path()
     if not routing_config_path:
         raise RuntimeError("ROUTING_CONFIG_PATH is required for --import-routing")
@@ -3493,8 +3585,8 @@ def load_validated_routing_seed(config_path: str) -> RoutingConfig:
 
 
 def import_routing_from_seed(config_path: str, db_path: str, *, replace: bool) -> None:
-    routing = load_validated_routing_seed(config_path)
     with db_connect(db_path) as conn:
+        routing = load_validated_routing_seed(conn, config_path)
         import_routing_config_to_db(conn, routing, replace=replace)
     mode = "replaced" if replace else "merged"
     LOG.info(
@@ -3507,22 +3599,25 @@ def import_routing_from_seed(config_path: str, db_path: str, *, replace: bool) -
 
 
 def export_settings_to_yaml(config_path: str, db_path: str, export_path: str) -> None:
-    source_ids = load_source_ids(config_path)
     with db_connect(db_path) as conn:
+        ensure_source_state_seeded(conn, config_path)
+        sources = load_sources_from_db(conn)
+        source_ids = collect_source_ids(sources)
         routing = load_routing_config_from_db(conn, source_ids)
 
     path = Path(export_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(
-            routing_config_to_yaml_data(routing),
+            {"sources": sources, **routing_config_to_yaml_data(routing)},
             f,
             allow_unicode=True,
             sort_keys=False,
         )
     LOG.info(
-        "settings exported to %s: admins=%d groups=%d chats=%d",
+        "settings exported to %s: sources=%d admins=%d groups=%d chats=%d",
         path,
+        len(sources),
         len(routing.admins),
         len(routing.source_groups),
         len(routing.chats),
@@ -3530,14 +3625,19 @@ def export_settings_to_yaml(config_path: str, db_path: str, export_path: str) ->
 
 
 def import_settings_from_yaml(config_path: str, db_path: str, import_path: str, *, replace: bool) -> None:
-    source_ids = load_source_ids(config_path)
-    routing = load_routing_config(import_path, source_ids)
+    settings_data = load_yaml_file(import_path)
+    sources = settings_data.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError("settings import must contain top-level 'sources' list")
+    source_ids = validate_source_config({"sources": sources})
+    routing = load_routing_config_data(settings_data, source_ids)
     with db_connect(db_path) as conn:
         foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
         try:
             if replace:
                 conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN")
+            import_sources_to_db(conn, sources, replace=replace, commit=False)
             import_routing_config_to_db(conn, routing, replace=replace, commit=False)
             conn.commit()
         except Exception:
@@ -3548,9 +3648,10 @@ def import_settings_from_yaml(config_path: str, db_path: str, import_path: str, 
                 conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
     mode = "replaced" if replace else "merged"
     LOG.info(
-        "settings %s from %s: admins=%d groups=%d chats=%d",
+        "settings %s from %s: sources=%d admins=%d groups=%d chats=%d",
         mode,
         import_path,
+        len(sources),
         len(routing.admins),
         len(routing.source_groups),
         len(routing.chats),

@@ -195,6 +195,8 @@ SUMMARY_QUEUE_PRUNE_STALE=true
 
 `products.yaml` должен содержать top-level `sources` list и опциональный `poll_minutes`.
 
+При первом запуске `sources` импортируются в SQLite runtime store. После этого обычные runtime/validation paths читают source definitions из SQLite; `products.yaml` остается seed/backup-файлом и источником `poll_minutes`.
+
 Пример GitHub Releases:
 
 ```yaml
@@ -223,6 +225,8 @@ sources:
 ```
 
 `source.id` — ключ дедупликации в SQLite. Если изменить id, старые entries будут выглядеть как новые.
+
+`--export-settings` и `--import-settings` включают runtime source definitions вместе с routing-настройками. Runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries` и `source_state` не экспортируются и не удаляются при `--import-settings --replace`.
 
 ## Validation
 

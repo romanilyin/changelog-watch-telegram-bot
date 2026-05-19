@@ -1,18 +1,18 @@
 # Current Iteration
 
-## Iteration 2: Runtime Sources In SQLite
+## Iteration 3: Telegram Read/List Commands
 
-Цель: перенести source definitions из `products.yaml` в SQLite runtime state, сохранив YAML как seed/backup/import/export слой.
+Цель: добавить read/list Telegram-команды для просмотра runtime settings без ручного доступа к SQLite/YAML.
 
 ## Scope
 
-- Спроектировать SQLite tables для runtime sources.
-- Добавить seed/import path из `products.yaml` без потери history state.
-- Обновить validation так, чтобы source ids читались из runtime DB.
-- Сохранить YAML backup/restore сценарий для settings.
+- Добавить Telegram-команды `/sources`, `/admins`, `/chats`.
+- Показывать краткие списки runtime sources, admins и chats из SQLite.
+- Сохранить текущий write-flow через существующие команды и CLI.
+- Не раскрывать секреты и не читать локальные `.env` значения в Telegram-ответах.
 
 ## Out Of Scope
 
-- Telegram-команды `/sources`, `/admins`, `/chats`.
 - Pending-flow для source/chat.
+- Изменение source definitions из Telegram.
 - Изменение provider/model ключей и `ai-summary-models.local.yaml`.
