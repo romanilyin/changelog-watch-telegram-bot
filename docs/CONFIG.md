@@ -316,8 +316,14 @@ Dry-run:
 
 В continuous mode доступны команды админам из routing state:
 
+- `/admins` — список admin ids и aliases из SQLite.
+- `/chats` или `/contacts` — список чатов: id, alias/title, enabled, delivery mode, counts groups/sources.
+- `/sources` или `/projects` — список runtime sources из SQLite: id, product, type, enabled.
+- `/source <source_id>` или `/info <source_id>` — детали source и подписанные чаты/группы.
 - `/reload` — перечитать routing state.
 - `/subscribe <source_id> [chat_id|alias]` — добавить источник в чат.
 - `/unsubscribe <source_id> [chat_id|alias]` — убрать источник из чата.
+
+Команда `/id` показывает текущие `user_id` и `chat_id` и доступна любому пользователю для первичной настройки.
 
 Изменения пишутся в SQLite и сохраняются при рестарте. Они не перетираются seed-файлом в `ROUTING_SEED_MODE=once`.

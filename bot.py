@@ -560,6 +560,147 @@ def parse_command(text: str | None) -> tuple[str, list[str]] | None:
     return command, parts[1:]
 
 
+def html_escape_value(value: Any) -> str:
+    text = normalize_string(value)
+    return html.escape(text if text else "-")
+
+
+def bool_status(value: bool) -> str:
+    return "on" if value else "off"
+
+
+def sort_telegram_ids(values: set[str] | list[str]) -> list[str]:
+    return sorted(values, key=lambda item: int(item))
+
+
+def format_admins_command(routing: RoutingConfig) -> str:
+    lines = ["<b>Admins</b>"]
+    if not routing.admins:
+        lines.append("No admins in routing state.")
+        return "\n".join(lines)
+
+    admin_alias_lookup = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
+    for admin_id in sort_telegram_ids(routing.admins):
+        alias = admin_alias_lookup.get(admin_id)
+        suffix = f" @{html_escape_value(alias)}" if alias else ""
+        lines.append(f"<code>{html.escape(admin_id)}</code>{suffix}")
+    return "\n".join(lines)
+
+
+def format_chats_command(routing: RoutingConfig) -> str:
+    lines = ["<b>Chats</b>"]
+    if not routing.chats:
+        lines.append("No chats in routing state.")
+        return "\n".join(lines)
+
+    for chat in sorted(routing.chats.values(), key=lambda item: int(item.chat_id)):
+        alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+        title = f" {html_escape_value(chat.title)}" if chat.title else ""
+        lines.append(
+            f"<code>{html.escape(chat.chat_id)}</code>{alias}{title} "
+            f"enabled={bool_status(chat.enabled)} mode={html.escape(chat.delivery_mode)} "
+            f"groups={len(chat.groups)} sources={len(chat.source_ids)}"
+        )
+    return "\n".join(lines)
+
+
+def format_sources_command(sources: list[dict[str, Any]]) -> str:
+    lines = ["<b>Sources</b>"]
+    if not sources:
+        lines.append("No runtime sources in SQLite.")
+        return "\n".join(lines)
+
+    for source in sorted(sources, key=lambda item: str(item.get("id", ""))):
+        source_id = html_escape_value(source.get("id"))
+        product = html_escape_value(source.get("product"))
+        source_type = html_escape_value(source.get("type"))
+        enabled = bool_status(source.get("enabled", True) is not False)
+        lines.append(f"<code>{source_id}</code> {product} type={source_type} enabled={enabled}")
+    return "\n".join(lines)
+
+
+def format_source_details_command(source_id: str, sources: list[dict[str, Any]], routing: RoutingConfig) -> str:
+    source = next((item for item in sources if item.get("id") == source_id), None)
+    if source is None:
+        return f"Источник <code>{html.escape(source_id)}</code> не найден в runtime sources."
+
+    groups = sorted(group_name for group_name, group_sources in routing.source_groups.items() if source_id in group_sources)
+    direct_chats = sorted(
+        (chat for chat in routing.chats.values() if source_id in chat.source_ids),
+        key=lambda item: int(item.chat_id),
+    )
+    group_chats = sorted(
+        (chat for chat in routing.chats.values() if any(group_name in chat.groups for group_name in groups)),
+        key=lambda item: int(item.chat_id),
+    )
+
+    lines = [
+        f"<b>Source</b> <code>{html.escape(source_id)}</code>",
+        f"product={html_escape_value(source.get('product'))}",
+        f"type={html_escape_value(source.get('type'))} enabled={bool_status(source.get('enabled', True) is not False)}",
+        f"groups={html_escape_value(', '.join(groups))}",
+    ]
+
+    def chat_label(chat: ChatRouting) -> str:
+        alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+        title = f" {html_escape_value(chat.title)}" if chat.title else ""
+        return f"<code>{html.escape(chat.chat_id)}</code>{alias}{title} enabled={bool_status(chat.enabled)} mode={html.escape(chat.delivery_mode)}"
+
+    lines.append("direct chats:")
+    lines.extend([chat_label(chat) for chat in direct_chats] or ["-"])
+    lines.append("via groups:")
+    lines.extend([chat_label(chat) for chat in group_chats] or ["-"])
+    return "\n".join(lines)
+
+
+def format_id_command(message: dict[str, Any]) -> str:
+    raw_user_id = (message.get("from") or {}).get("id")
+    raw_chat_id = (message.get("chat") or {}).get("id")
+    user_id = "-" if raw_user_id is None else html.escape(str(raw_user_id))
+    chat_id = "-" if raw_chat_id is None else html.escape(str(raw_chat_id))
+    return f"user_id=<code>{user_id}</code>\nchat_id=<code>{chat_id}</code>"
+
+
+def format_help_command() -> str:
+    return "\n".join(
+        [
+            "<b>Commands</b>",
+            "/id",
+            "/admins",
+            "/chats or /contacts",
+            "/sources or /projects",
+            "/source &lt;source_id&gt; or /info &lt;source_id&gt;",
+            "/reload",
+            "/subscribe &lt;source_id&gt; [chat_id|alias]",
+            "/unsubscribe &lt;source_id&gt; [chat_id|alias]",
+        ]
+    )
+
+
+def chunk_telegram_html_message(text: str, max_chars: int = 3500) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.splitlines():
+        line_len = len(line) + 1
+        if line_len > max_chars:
+            line = line[: max_chars - 20] + "\n... truncated"
+            line_len = len(line) + 1
+        if current and current_len + line_len > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 def is_authorized_admin(admins: set[str], raw_user_id: Any) -> bool:
     if not admins:
         return False
@@ -2673,6 +2814,11 @@ async def send_telegram_message(client: httpx.AsyncClient, token: str, chat_id: 
     response.raise_for_status()
 
 
+async def send_telegram_message_chunks(client: httpx.AsyncClient, token: str, chat_id: str, text: str) -> None:
+    for chunk in chunk_telegram_html_message(text):
+        await send_telegram_message(client, token, chat_id, chunk)
+
+
 async def telegram_api_get_result(
     client: httpx.AsyncClient,
     token: str,
@@ -2839,12 +2985,21 @@ async def run_admin_command_listener(
                         continue
 
                     command, args = parsed
-                    if command not in {"reload", "subscribe", "unsubscribe", "start", "help"}:
-                        continue
-
-                    source_ids = load_runtime_source_ids(db_path, config_path)
-                    routing = routing_state.get(source_ids)
-                    if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
+                    if command not in {
+                        "reload",
+                        "subscribe",
+                        "unsubscribe",
+                        "start",
+                        "help",
+                        "id",
+                        "admins",
+                        "chats",
+                        "contacts",
+                        "sources",
+                        "projects",
+                        "source",
+                        "info",
+                    }:
                         continue
 
                     reply_chat_id_raw = message.get("chat", {}).get("id")
@@ -2852,6 +3007,18 @@ async def run_admin_command_listener(
                         continue
 
                     reply_chat_id = str(int(str(reply_chat_id_raw).strip()))
+
+                    if command == "id":
+                        await send_telegram_message(client, telegram_token, reply_chat_id, format_id_command(message))
+                        continue
+
+                    with db_connect(db_path) as conn:
+                        runtime_config = load_runtime_config(conn, config_path)
+                        sources = runtime_config["sources"]
+                    source_ids = collect_source_ids(sources)
+                    routing = routing_state.get(source_ids)
+                    if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
+                        continue
 
                     if command == "reload":
                         routing_state.get(source_ids, force_reload=True)
@@ -2870,7 +3037,7 @@ async def run_admin_command_listener(
                                 client,
                                 telegram_token,
                                 reply_chat_id,
-                                "Использование: /subscribe <source_id> [chat_id|alias] или /unsubscribe <source_id> [chat_id|alias]",
+                                "Использование: /subscribe &lt;source_id&gt; [chat_id|alias] или /unsubscribe &lt;source_id&gt; [chat_id|alias]",
                             )
                             continue
 
@@ -2880,7 +3047,7 @@ async def run_admin_command_listener(
                                 client,
                                 telegram_token,
                                 reply_chat_id,
-                                f"Источник {source_id!r} отсутствует в products.yaml",
+                                f"Источник <code>{html.escape(source_id)}</code> отсутствует в runtime sources",
                             )
                             continue
 
@@ -2891,7 +3058,7 @@ async def run_admin_command_listener(
                                 client,
                                 telegram_token,
                                 reply_chat_id,
-                                f"Чат {target_chat_token!r} не найден. Укажи chat_id или alias из routing DB.",
+                                f"Чат <code>{html.escape(target_chat_token)}</code> не найден. Укажи chat_id или alias из routing DB.",
                             )
                             continue
 
@@ -2912,7 +3079,51 @@ async def run_admin_command_listener(
                             )
 
                         reload_requested.set()
-                        await send_telegram_message(client, telegram_token, reply_chat_id, result)
+                        await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
+                        continue
+
+                    if command == "admins":
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_admins_command(routing),
+                        )
+                        continue
+
+                    if command in {"chats", "contacts"}:
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_chats_command(routing),
+                        )
+                        continue
+
+                    if command in {"sources", "projects"}:
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_sources_command(sources),
+                        )
+                        continue
+
+                    if command in {"source", "info"}:
+                        if not args:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                "Использование: /source &lt;source_id&gt; или /info &lt;source_id&gt;",
+                            )
+                            continue
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_source_details_command(normalize_source_id(args[0]), sources, routing),
+                        )
                         continue
 
                     if command in {"start", "help"}:
@@ -2920,7 +3131,7 @@ async def run_admin_command_listener(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            "Доступные команды: /reload, /subscribe <source_id> [chat_id|alias], /unsubscribe <source_id> [chat_id|alias]",
+                            format_help_command(),
                         )
                         continue
 

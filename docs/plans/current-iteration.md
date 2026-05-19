@@ -1,18 +1,17 @@
 # Current Iteration
 
-## Iteration 3: Telegram Read/List Commands
+## Iteration 4: Telegram Admin/Chat Management
 
-Цель: добавить read/list Telegram-команды для просмотра runtime settings без ручного доступа к SQLite/YAML.
+Цель: добавить Telegram-команды управления admins/chats поверх SQLite runtime settings.
 
 ## Scope
 
-- Добавить Telegram-команды `/sources`, `/admins`, `/chats`.
-- Показывать краткие списки runtime sources, admins и chats из SQLite.
-- Сохранить текущий write-flow через существующие команды и CLI.
-- Не раскрывать секреты и не читать локальные `.env` значения в Telegram-ответах.
+- Pending-flow для добавления admin/chat из Telegram.
+- Включение/отключение чатов из Telegram.
+- Управление alias/title/delivery mode для chats.
+- Сохранить SQLite как runtime source-of-truth.
 
 ## Out Of Scope
 
-- Pending-flow для source/chat.
 - Изменение source definitions из Telegram.
 - Изменение provider/model ключей и `ai-summary-models.local.yaml`.

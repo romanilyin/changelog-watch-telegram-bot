@@ -78,6 +78,14 @@ Windows PowerShell 7 + WSL:
 
 Подробно: `docs/CONFIG.md`.
 
+## Telegram Admin Commands
+
+В continuous mode доступны runtime-команды:
+
+- `/id` — показать текущие `user_id` и `chat_id`, доступно любому пользователю.
+- `/admins`, `/chats` (`/contacts`), `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`) — короткий просмотр runtime settings из SQLite, только для admins.
+- `/reload`, `/subscribe <source_id> [chat_id|alias]`, `/unsubscribe <source_id> [chat_id|alias]` — существующие admin write/reload команды.
+
 ## Документация
 
 - `docs/INSTALL_WSL.md` — полный setup в Windows + WSL.

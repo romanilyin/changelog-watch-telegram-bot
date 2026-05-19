@@ -47,4 +47,12 @@
 - Runtime, validation, scheduler и admin-command paths читают source ids/configs из SQLite после seed.
 - `--export-settings`/`--import-settings` теперь включают runtime sources вместе с routing settings.
 - `--import-settings --replace` заменяет source/routing settings транзакционно и не удаляет history/runtime tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state`.
-- Следующая итерация: Telegram read/list commands.
+
+## Iteration 3: Telegram Read/List Commands
+
+- Расширен существующий HTTP long-polling admin listener без `python-telegram-bot`.
+- Добавлены read/list команды из SQLite runtime state: `/admins`, `/chats` (`/contacts`), `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`).
+- Добавлена команда `/id`, доступная любому пользователю для setup.
+- `/help` обновлен с read aliases и существующими `/reload`, `/subscribe`, `/unsubscribe`.
+- Telegram-ответы экранируют runtime/user values для HTML parse mode и режутся на короткие chunks.
+- Следующая итерация: Telegram admin/chat management.
