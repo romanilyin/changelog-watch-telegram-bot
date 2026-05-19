@@ -73,3 +73,11 @@
 - Apply/toggle/remove пишут SQLite и запрашивают reload; `/removesource` блокируется при ссылках из source groups или direct chat subscriptions.
 - Telegram source commands не принимают provider/model/API keys.
 - Следующая итерация: subscription aliases and operational commands.
+
+## Iteration 6: Subscription Aliases And Operational Commands
+
+- Добавлены aliases `/link` и `/unlink` для совместимости со старым GitLab bot UX.
+- Добавлены convenience commands `/subscribe_here`, `/unsubscribe_here`, `/subscriptions [chat_id|alias]`.
+- Добавлена safe operational команда `/status` с runtime counts, `poll_minutes` и безопасной меткой DB path.
+- Mutating subscription commands пишут SQLite и запрашивают routing reload.
+- `/help`, `README.md` и `docs/CONFIG.md` обновлены минимально.

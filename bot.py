@@ -711,6 +711,64 @@ def format_source_details_command(source_id: str, sources: list[dict[str, Any]],
     return "\n".join(lines)
 
 
+def format_subscriptions_command(chat_id: str, routing: RoutingConfig) -> str:
+    chat = routing.chats.get(chat_id)
+    if chat is None:
+        return f"Chat <code>{html.escape(chat_id)}</code> not found."
+
+    group_sources: set[str] = set()
+    for group_name in chat.groups:
+        group_sources.update(routing.source_groups.get(group_name, set()))
+
+    alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+    explicit = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in sorted(chat.source_ids)) or "-"
+    groups = ", ".join(html.escape(group_name) for group_name in sorted(chat.groups)) or "-"
+    derived = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in sorted(group_sources)) or "-"
+    return "\n".join(
+        [
+            f"<b>Subscriptions</b> <code>{html.escape(chat.chat_id)}</code>{alias}",
+            f"explicit: {explicit}",
+            f"groups: {groups}",
+            f"group-derived: {derived}",
+        ]
+    )
+
+
+def safe_db_path_label(db_path: str | Path) -> str:
+    path = Path(db_path).expanduser()
+    if path.is_absolute():
+        try:
+            return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return path.name
+    return path.as_posix()
+
+
+def format_status_command(
+    sources: list[dict[str, Any]],
+    routing: RoutingConfig,
+    conn: sqlite3.Connection,
+    *,
+    poll_minutes: int,
+    db_path: str | Path,
+) -> str:
+    enabled_sources = sum(1 for source in sources if source.get("enabled", True) is not False)
+    disabled_sources = len(sources) - enabled_sources
+    enabled_chats = sum(1 for chat in routing.chats.values() if chat.enabled)
+    disabled_chats = len(routing.chats) - enabled_chats
+    pending_chats = conn.execute("SELECT COUNT(*) FROM pending_chats").fetchone()[0]
+    pending_sources = conn.execute("SELECT COUNT(*) FROM pending_sources").fetchone()[0]
+    return "\n".join(
+        [
+            "<b>Status</b>",
+            f"sources: enabled={enabled_sources} disabled={disabled_sources}",
+            f"chats: enabled={enabled_chats} disabled={disabled_chats}",
+            f"admins={len(routing.admins)} pending_chats={pending_chats} pending_sources={pending_sources}",
+            f"poll_minutes={poll_minutes} db=<code>{html.escape(safe_db_path_label(db_path))}</code>",
+        ]
+    )
+
+
 def format_source_preview(source: dict[str, Any], entries: list[ChangelogEntry]) -> str:
     lines = [
         f"<b>Source preview</b> {html_escape_value(source.get('product') or source.get('id'))}",
@@ -750,6 +808,7 @@ def format_help_command() -> str:
             "/pendingsources /confirmsource &lt;token&gt; /rejectsource &lt;token&gt;",
             "/enablesource &lt;source_id&gt; /disablesource &lt;source_id&gt; /removesource &lt;source_id&gt;",
             "/reload",
+            "/status",
             "/approvechat &lt;chat_id&gt; [alias]",
             "/rejectchat &lt;chat_id&gt;",
             "/addchat_here [alias]",
@@ -759,8 +818,10 @@ def format_help_command() -> str:
             "/setchatalias &lt;chat_id|alias&gt; &lt;alias|-&gt;",
             "/setchattitle &lt;chat_id|alias&gt; &lt;title|-&gt;",
             "/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;",
-            "/subscribe &lt;source_id&gt; [chat_id|alias]",
-            "/unsubscribe &lt;source_id&gt; [chat_id|alias]",
+            "/subscribe &lt;source_id&gt; [chat_id|alias] /link &lt;source_id&gt; &lt;chat_id|alias&gt;",
+            "/unsubscribe &lt;source_id&gt; [chat_id|alias] /unlink &lt;source_id&gt; &lt;chat_id|alias&gt;",
+            "/subscribe_here &lt;source_id&gt; /unsubscribe_here &lt;source_id&gt;",
+            "/subscriptions [chat_id|alias]",
         ]
     )
 
@@ -3501,8 +3562,14 @@ async def run_admin_command_listener(
                     command, args = parsed
                     if command not in {
                         "reload",
+                        "status",
                         "subscribe",
                         "unsubscribe",
+                        "link",
+                        "unlink",
+                        "subscribe_here",
+                        "unsubscribe_here",
+                        "subscriptions",
                         "start",
                         "help",
                         "id",
@@ -3571,6 +3638,7 @@ async def run_admin_command_listener(
                     with db_connect(db_path) as conn:
                         runtime_config = load_runtime_config(conn, config_path)
                         sources = runtime_config["sources"]
+                        poll_minutes = int(runtime_config.get("poll_minutes", 30))
                     source_ids = collect_source_ids(sources)
                     routing = routing_state.get(source_ids)
                     if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
@@ -3591,6 +3659,18 @@ async def run_admin_command_listener(
                         with db_connect(db_path) as conn:
                             text = format_pending_chats_command(conn)
                         await send_telegram_message_chunks(client, telegram_token, reply_chat_id, text)
+                        continue
+
+                    if command == "status":
+                        with db_connect(db_path) as conn:
+                            text = format_status_command(
+                                sources,
+                                routing,
+                                conn,
+                                poll_minutes=poll_minutes,
+                                db_path=db_path,
+                            )
+                        await send_telegram_message(client, telegram_token, reply_chat_id, text)
                         continue
 
                     if command == "approvechat":
@@ -3852,13 +3932,32 @@ async def run_admin_command_listener(
                             await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
-                    if command in {"subscribe", "unsubscribe"}:
+                    if command == "subscriptions":
+                        target_chat_token = args[0] if args else reply_chat_id
+                        target_chat_id = resolve_chat_identifier(target_chat_token, routing)
+                        if target_chat_id is None:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Chat <code>{html.escape(target_chat_token)}</code> not found.",
+                            )
+                            continue
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_subscriptions_command(target_chat_id, routing),
+                        )
+                        continue
+
+                    if command in {"subscribe", "unsubscribe", "link", "unlink", "subscribe_here", "unsubscribe_here"}:
                         if not args:
                             await send_telegram_message(
                                 client,
                                 telegram_token,
                                 reply_chat_id,
-                                "Использование: /subscribe &lt;source_id&gt; [chat_id|alias] или /unsubscribe &lt;source_id&gt; [chat_id|alias]",
+                                "Usage: /subscribe &lt;source_id&gt; [chat_id|alias], /link &lt;source_id&gt; &lt;chat_id|alias&gt;, /subscribe_here &lt;source_id&gt;",
                             )
                             continue
 
@@ -3872,7 +3971,7 @@ async def run_admin_command_listener(
                             )
                             continue
 
-                        target_chat_token = args[1] if len(args) > 1 else reply_chat_id
+                        target_chat_token = reply_chat_id if command.endswith("_here") else (args[1] if len(args) > 1 else reply_chat_id)
                         target_chat_id = resolve_chat_identifier(target_chat_token, routing)
                         if target_chat_id is None:
                             await send_telegram_message(
@@ -3883,7 +3982,8 @@ async def run_admin_command_listener(
                             )
                             continue
 
-                        if command == "subscribe":
+                        add_subscription = command in {"subscribe", "link", "subscribe_here"}
+                        if add_subscription:
                             result = apply_chat_subscription_change(
                                 db_path,
                                 source_id,
@@ -3900,6 +4000,7 @@ async def run_admin_command_listener(
                             )
 
                         reload_requested.set()
+                        routing_state.get(source_ids, force_reload=True)
                         await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
                         continue
 

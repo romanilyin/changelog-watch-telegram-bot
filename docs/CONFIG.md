@@ -228,6 +228,8 @@ sources:
 
 Telegram admins могут управлять runtime sources через staging flow: `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource`. Перед staging бот вызывает обычный `parse_source` path и требует хотя бы одну найденную entry; provider/model/API keys через Telegram не настраиваются.
 
+Subscription commands: `/subscribe` (`/link`), `/unsubscribe` (`/unlink`), `/subscribe_here`, `/unsubscribe_here`, `/subscriptions [chat_id|alias]`. Operational status: `/status` shows safe counts, `poll_minutes`, and a non-secret DB path label.
+
 `/removesource <source_id>` удаляет только source definition и только если он не используется в `source_groups` или direct chat subscriptions. History/runtime tables не удаляются.
 
 `--export-settings` и `--import-settings` включают runtime source definitions вместе с routing-настройками. Pending staging rows `pending_sources` и runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries` и `source_state` не экспортируются и не удаляются при `--import-settings --replace`.
@@ -330,8 +332,12 @@ Dry-run:
 - `/addadmin <user_id> [alias]`, `/removeadmin <user_id|alias>` — управление админами; последний admin защищён от удаления.
 - `/setchatalias <chat_id|alias> <alias|->`, `/setchattitle <chat_id|alias> <title|->`, `/setchatdelivery <chat_id|alias> <instant|digest|both|none>` — runtime-настройки чата.
 - `/reload` — перечитать routing state.
+- `/status` — безопасный runtime status без секретов: counts, pending counts, `poll_minutes`, короткая DB path метка.
+- `/subscriptions [chat_id|alias]` — explicit и group-derived подписки выбранного или текущего чата.
 - `/subscribe <source_id> [chat_id|alias]` — добавить источник в чат.
 - `/unsubscribe <source_id> [chat_id|alias]` — убрать источник из чата.
+- `/link <source_id> <chat_id|alias>`, `/unlink <source_id> <chat_id|alias>` — aliases для `/subscribe` и `/unsubscribe` в стиле старого GitLab bot UX.
+- `/subscribe_here <source_id>`, `/unsubscribe_here <source_id>` — изменить подписку текущего чата.
 
 Команды `/id`, `/requestchat [alias]` и `/addme [alias]` доступны любому пользователю. `/addme` работает только в private chat. Pending-заявки сохраняются в SQLite с chat metadata и не раскрывают `.env`/secrets.
 
