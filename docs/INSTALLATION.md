@@ -1,4 +1,4 @@
-# Инструкция По Установке И Переносу
+# Инструкция по установке и переносу
 
 Эта инструкция описывает установку `changelog-watch-telegram-bot` на Ubuntu, WSL Ubuntu и Windows 11, включая автозапуск после рестарта системы и перенос настроек на другую машину.
 
@@ -8,25 +8,25 @@
 
 - Python 3.10+ с `venv`.
 - Git или архив с репозиторием.
-- Telegram bot token от `@BotFather`.
+- Токен Telegram-бота от `@BotFather`.
 - Telegram `user_id` админа и `chat_id` целевых чатов.
 - Доступ бота к целевым чатам: для группы бот должен быть участником, для канала бот должен быть администратором с правом публикации.
-- Опционально: `GITHUB_TOKEN`, если много GitHub sources и нужны повышенные rate limits.
-- Опционально: ключи AI providers для AI summaries.
+- Опционально: `GITHUB_TOKEN`, если много GitHub-источников и нужны повышенные лимиты запросов.
+- Опционально: ключи AI-провайдеров для AI-сводок.
 
 Основные runtime-файлы:
 
-- `.env` - секреты, пути и runtime flags.
+- `.env` - секреты, пути и runtime-флаги.
 - `admin-routing.yaml` - seed-файл admins/chats/groups для первого импорта в SQLite.
 - `products.yaml` - seed/backup источников и `poll_minutes`.
-- `data/posted.sqlite3` - основное runtime state: posted items, deliveries, digest queue, AI cache, runtime sources и routing.
-- `ai-summary-models.local.yaml` - локальный ordered fallback моделей для AI summary.
-- `scripts/model-summary-compare.local.yaml` - локальный config для сравнения моделей.
+- `data/posted.sqlite3` - основное runtime-состояние: опубликованные записи, доставки, очередь digest, AI-кэш, runtime-источники и routing.
+- `ai-summary-models.local.yaml` - локальный упорядоченный fallback моделей для AI-сводок.
+- `scripts/model-summary-compare.local.yaml` - локальный конфиг для сравнения моделей.
 - `data/model-decisions.yaml` - локальные решения для скрытия/повтора моделей при сравнении.
 
 Файлы `.env`, `*.local.yaml`, `admin-routing.yaml` и `data/` не коммитятся в git.
 
-## Telegram Setup
+## Настройка Telegram
 
 1. Создай бота через `@BotFather` и сохрани token.
 2. Добавь бота в нужные группы/каналы.
@@ -93,7 +93,7 @@ GITHUB_TOKEN=
 
 `TELEGRAM_CHAT_ID` является legacy и в routing mode игнорируется.
 
-## Настройка Routing
+## Настройка маршрутизации
 
 Скопируй пример:
 
@@ -148,7 +148,7 @@ chats:
       time: "08:00"
 ```
 
-Delivery modes:
+Режимы доставки:
 
 | Mode | Поведение |
 |---|---|
@@ -157,7 +157,7 @@ Delivery modes:
 | `both` | Отправляет instant posts и дополнительно digest. |
 | `none` | Ничего не отправляет в этот chat. |
 
-Schedule modes:
+Режимы расписания:
 
 | Mode | Поведение |
 |---|---|
@@ -168,9 +168,9 @@ Schedule modes:
 
 После первого запуска routing сохраняется в SQLite. Дальше Telegram admin-команды меняют runtime state в `data/posted.sqlite3`.
 
-## AI Summary Setup
+## Настройка AI-Сводок
 
-AI summaries опциональны. Включение:
+AI-сводки опциональны. Включение:
 
 ```env
 AI_SUMMARY_ENABLED=true
@@ -181,13 +181,13 @@ OPENROUTER_API_KEY=...
 OLLAMA_API_KEY=...
 ```
 
-Создай local config:
+Создай локальный конфиг:
 
 ```bash
 cp ai-summary-models.example.yaml ai-summary-models.local.yaml
 ```
 
-Если `AI_SUMMARY_MODELS_CONFIG` задан, бот пробует models сверху вниз и использует первый успешный русскоязычный summary. Если config не задан, работает legacy mode через `AI_SUMMARY_API_BASE`, `AI_SUMMARY_MODEL` и `AI_SUMMARY_API_KEY`.
+Если `AI_SUMMARY_MODELS_CONFIG` задан, бот пробует модели сверху вниз и использует первую успешную русскоязычную сводку. Если конфиг не задан, работает legacy-режим через `AI_SUMMARY_API_BASE`, `AI_SUMMARY_MODEL` и `AI_SUMMARY_API_KEY`.
 
 Dry-run по умолчанию не вызывает AI API. Для явной проверки API в dry-run:
 
@@ -253,7 +253,7 @@ cd /opt/changelog-watch-telegram-bot
 sudo chown -R changelogbot:changelogbot /opt/changelog-watch-telegram-bot
 ```
 
-### 4. Создать venv и установить Python packages
+### 4. Создать venv и установить Python-пакеты
 
 ```bash
 cd /opt/changelog-watch-telegram-bot
@@ -263,7 +263,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 5. Создать локальные config files
+### 5. Создать локальные конфиги
 
 ```bash
 cp .env.example .env
@@ -403,7 +403,7 @@ wsl -d Ubuntu
 systemctl --version
 ```
 
-### 3. Установить бота внутри Linux filesystem
+### 3. Установить бота внутри файловой системы Linux
 
 Рекомендуется держать runtime в `~/bots` или `/opt`, а не в `/mnt/c`, чтобы SQLite и venv работали быстрее и надежнее.
 
@@ -475,7 +475,7 @@ sudo systemctl status changelog-watch-bot --no-pager
 
 ### 5. Автозапуск После Рестарта Windows
 
-`systemctl enable` стартует service при запуске WSL distro. Но Windows не всегда запускает WSL distro сам после reboot. Добавь Windows Scheduled Task, который поднимает WSL при logon.
+`systemctl enable` стартует service при запуске WSL-дистрибутива. Но Windows не всегда запускает WSL-дистрибутив сам после перезагрузки. Добавь задачу Windows Task Scheduler, которая поднимает WSL при входе пользователя.
 
 В Windows PowerShell:
 
@@ -492,7 +492,7 @@ Register-ScheduledTask -TaskName "Start WSL Ubuntu for Changelog Bot" -Action $A
 wsl -d Ubuntu -- systemctl status changelog-watch-bot --no-pager
 ```
 
-Если не хочешь использовать systemd в WSL, можно создать Scheduled Task, который сразу запускает bot через `nohup`:
+Если не хочешь использовать systemd в WSL, можно создать задачу Task Scheduler, которая сразу запускает бота через `nohup`:
 
 ```powershell
 $Command = 'cd ~/bots/changelog-watch-telegram-bot && mkdir -p data && nohup ./.venv/bin/python bot.py >> data/bot.log 2>&1 < /dev/null &'
@@ -502,13 +502,13 @@ $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvai
 Register-ScheduledTask -TaskName "Changelog Watch Bot WSL" -Action $Action -Trigger $Trigger -Settings $Settings
 ```
 
-Вариант с systemd предпочтительнее, потому что service сам рестартует бот при падении.
+Вариант с systemd предпочтительнее, потому что service сам перезапускает бота при падении.
 
 ## Windows 11
 
 Нативный запуск через Windows Python сейчас не поддерживается: `bot.py` использует POSIX `fcntl` для singleton lock и Linux process semantics. На Windows 11 запускай бота через WSL Ubuntu.
 
-Этот раздел описывает Windows 11 как host: код может лежать в Windows path, а процесс выполняется внутри WSL через PowerShell scripts из репозитория.
+Этот раздел описывает Windows 11 как host-систему: код может лежать в Windows path, а процесс выполняется внутри WSL через PowerShell-скрипты из репозитория.
 
 ### 1. Установить компоненты
 
@@ -529,15 +529,15 @@ git clone https://github.com/romanilyin/changelog-watch-telegram-bot.git
 cd C:\Bots\changelog-watch-telegram-bot
 ```
 
-### 2. Установить Linux Dependencies В Этом Repo Через WSL
+### 2. Установить Linux-зависимости в этом репозитории через WSL
 
-PowerShell scripts ожидают, что в WSL внутри repo есть `.venv/bin/python`.
+PowerShell-скрипты ожидают, что в WSL внутри repo есть `.venv/bin/python`.
 
 ```powershell
 wsl -d Ubuntu -- bash -lc "cd /mnt/c/Bots/changelog-watch-telegram-bot && sudo apt update && sudo apt install -y python3 python3-venv python3-pip git ca-certificates curl && python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt"
 ```
 
-### 3. Создать Локальные Configs
+### 3. Создать Локальные Конфиги
 
 В PowerShell:
 
@@ -556,7 +556,7 @@ wsl -d Ubuntu -- bash -lc "cd /mnt/c/Bots/changelog-watch-telegram-bot && ./.ven
 wsl -d Ubuntu -- bash -lc "cd /mnt/c/Bots/changelog-watch-telegram-bot && ./.venv/bin/python bot.py --once --dry-run"
 ```
 
-### 4. Запуск Через PowerShell Scripts
+### 4. Запуск Через PowerShell-Скрипты
 
 Из PowerShell 7 в корне repo:
 
@@ -580,7 +580,7 @@ wsl -d Ubuntu -- bash -lc "cd /mnt/c/Bots/changelog-watch-telegram-bot && ./.ven
 
 ### 5. Автозапуск После Рестарта Windows 11
 
-Создай Scheduled Task at logon, который запускает PowerShell wrapper.
+Создай задачу Windows Task Scheduler при входе пользователя, которая запускает PowerShell-wrapper.
 
 В PowerShell 7:
 
@@ -593,7 +593,7 @@ $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvai
 Register-ScheduledTask -TaskName "Changelog Watch Telegram Bot" -Action $Action -Trigger $Trigger -Settings $Settings -Description "Start changelog-watch-telegram-bot in WSL"
 ```
 
-Проверка task:
+Проверка задачи:
 
 ```powershell
 Start-ScheduledTask -TaskName "Changelog Watch Telegram Bot"
@@ -607,15 +607,15 @@ Get-ScheduledTaskInfo -TaskName "Changelog Watch Telegram Bot"
 Unregister-ScheduledTask -TaskName "Changelog Watch Telegram Bot" -Confirm:$false
 ```
 
-Если repo лежит внутри Linux filesystem (`~/bots/...`), используй WSL section и Scheduled Task с `wsl.exe`, а не PowerShell wrapper path из Windows.
+Если репозиторий лежит внутри файловой системы Linux (`~/bots/...`), используй раздел WSL Ubuntu и задачу Task Scheduler с `wsl.exe`, а не путь PowerShell-wrapper из Windows.
 
 ## Перенос На Другую Машину
 
 Есть два способа: полный перенос SQLite state или перенос только routing/settings.
 
-### Вариант A: Полный Перенос State
+### Вариант A: Полный перенос состояния
 
-Этот вариант сохраняет память о публикациях, delivery statuses, digest queue, AI cache, runtime sources и routing. Он предпочтителен для production migration.
+Этот вариант сохраняет память о публикациях, статусы доставок, очередь digest, AI-кэш, runtime-источники и routing. Он предпочтителен для production-миграции.
 
 На старой машине останови бота:
 
@@ -653,9 +653,9 @@ python bot.py --once --dry-run
 
 Если `data/posted.sqlite3` перенесен, бот не должен повторно отправлять уже известные релизы.
 
-### Вариант B: Перенос Только Settings
+### Вариант B: Перенос только настроек
 
-Этот вариант переносит runtime sources/routing/admin/chats/subscriptions, но не переносит posted history, deliveries, digest queue и AI cache.
+Этот вариант переносит runtime-источники, routing, админов, чаты и подписки, но не переносит историю публикаций, доставки, очередь digest и AI-кэш.
 
 На старой машине:
 
@@ -717,11 +717,11 @@ journalctl -u changelog-watch-bot -n 100 --no-pager
 ./status-changelog-watch-bot.ps1 -Tail
 ```
 
-## Model Comparison Setup
+## Настройка Сравнения Моделей
 
-Сравнение моделей не требуется для работы Telegram bot, но полезно для выбора AI summary модели.
+Сравнение моделей не требуется для работы Telegram-бота, но полезно для выбора модели AI-сводок.
 
-Создай local config:
+Создай локальный конфиг:
 
 ```bash
 cp scripts/model-summary-compare.example.yaml scripts/model-summary-compare.local.yaml
@@ -745,15 +745,15 @@ python scripts/model-summary-admin.py --models-config scripts/model-summary-comp
 
 Открой `http://127.0.0.1:8765`.
 
-Локальные decisions:
+Локальные решения по моделям:
 
 ```bash
 cp scripts/model-decisions.example.yaml data/model-decisions.yaml
 ```
 
-`action: skip` и `action: retry_later` скрывают модели из lists/UI по умолчанию. Чтобы увидеть скрытые модели, добавь `--include-hidden-models`.
+`action: skip` и `action: retry_later` скрывают модели из списков и UI по умолчанию. Чтобы увидеть скрытые модели, добавь `--include-hidden-models`.
 
-## Troubleshooting
+## Диагностика Проблем
 
 Если бот не отправляет сообщения:
 
@@ -768,8 +768,8 @@ python bot.py --validate-config
 - Бот добавлен в чат или канал.
 - Для канала бот имеет право публиковать сообщения.
 - Chat id в routing state совпадает с реальным chat id.
-- Source enabled и chat enabled.
-- Delivery mode не `none`.
+- Source и chat включены.
+- Режим доставки не `none`.
 - В `data/posted.sqlite3` источник уже мог быть seeded, поэтому старые релизы не отправляются повторно.
 
 Если видишь `single-instance lock is already held`:
@@ -798,7 +798,7 @@ rm -f /tmp/changelog-watch-telegram-bot-*.lock
 - Проверь `AI_SUMMARY_ENABLED=true`.
 - Проверь `AI_SUMMARY_MODELS_CONFIG` и наличие local YAML.
 - Проверь provider API keys в `.env`.
-- Проверь logs на `missing API key`, `rate-limited`, `empty content`, `non-ru summary`.
+- Проверь логи на `missing API key`, `rate-limited`, `empty content`, `non-ru summary`.
 - Для dry-run API calls включи `AI_SUMMARY_DRY_RUN_CALL_API=true`.
 
 ## Безопасность
