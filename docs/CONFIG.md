@@ -270,6 +270,23 @@ python bot.py --import-routing --replace
 python bot.py --import-routing --replace --clear-summary-queue
 ```
 
+## Settings Backup/Restore
+
+Экспортировать runtime routing-настройки из SQLite в YAML:
+
+```bash
+python bot.py --export-settings data/settings-backup.yaml
+```
+
+Восстановить settings YAML в другую или существующую БД:
+
+```bash
+python bot.py --import-settings data/settings-backup.yaml --replace
+python bot.py --import-settings data/settings-backup.yaml --replace --db data/restored.sqlite3
+```
+
+Экспорт включает только routing/settings tables: admins, source groups, chats и подписки. Runtime/history таблицы `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state` не экспортируются и не удаляются при restore.
+
 ## Dry-Run
 
 ```bash

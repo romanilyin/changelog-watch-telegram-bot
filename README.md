@@ -33,6 +33,8 @@ python bot.py
 python bot.py --validate-config
 python bot.py --validate-config --migrate-db
 python bot.py --import-routing --replace
+python bot.py --export-settings data/settings-backup.yaml
+python bot.py --import-settings data/settings-backup.yaml --replace
 python bot.py --clear-summary-queue --chat-id 185073278
 python bot.py --once --dry-run
 python bot.py --once

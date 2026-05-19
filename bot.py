@@ -631,12 +631,7 @@ def replace_routing_tables(conn: sqlite3.Connection) -> None:
     foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
-        conn.execute("DELETE FROM routing_chat_sources")
-        conn.execute("DELETE FROM routing_chat_groups")
-        conn.execute("DELETE FROM routing_source_group_sources")
-        conn.execute("DELETE FROM routing_source_groups")
-        conn.execute("DELETE FROM routing_chats")
-        conn.execute("DELETE FROM routing_admins")
+        delete_routing_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -645,9 +640,27 @@ def replace_routing_tables(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
 
 
-def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig, *, replace: bool = False) -> None:
+def delete_routing_tables(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM routing_chat_sources")
+    conn.execute("DELETE FROM routing_chat_groups")
+    conn.execute("DELETE FROM routing_source_group_sources")
+    conn.execute("DELETE FROM routing_source_groups")
+    conn.execute("DELETE FROM routing_chats")
+    conn.execute("DELETE FROM routing_admins")
+
+
+def import_routing_config_to_db(
+    conn: sqlite3.Connection,
+    routing: RoutingConfig,
+    *,
+    replace: bool = False,
+    commit: bool = True,
+) -> None:
     if replace:
-        replace_routing_tables(conn)
+        if commit:
+            replace_routing_tables(conn)
+        else:
+            delete_routing_tables(conn)
 
     admin_alias_lookup: dict[str, str] = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
     if not replace:
@@ -719,7 +732,8 @@ def import_routing_config_to_db(conn: sqlite3.Connection, routing: RoutingConfig
                 (chat.chat_id, source_id),
             )
 
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def apply_chat_subscription_change_db(
@@ -1280,6 +1294,44 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
         source_groups=source_groups,
         chats=chats,
     )
+
+
+def routing_config_to_yaml_data(routing: RoutingConfig) -> dict[str, Any]:
+    admin_alias_lookup: dict[str, str] = {admin_id: alias for alias, admin_id in routing.admin_aliases.items()}
+    admins: list[Any] = []
+    for admin_id in sorted(routing.admins, key=int):
+        alias = admin_alias_lookup.get(admin_id)
+        admins.append({"id": admin_id, "alias": alias} if alias else admin_id)
+
+    source_groups = {
+        group_name: sorted(source_ids)
+        for group_name, source_ids in sorted(routing.source_groups.items())
+    }
+
+    chats: list[dict[str, Any]] = []
+    for chat in sorted(routing.chats.values(), key=lambda item: int(item.chat_id)):
+        summary_schedule: dict[str, Any] = {"mode": chat.summary_schedule.mode}
+        if chat.summary_schedule.mode in {"daily", "weekly"}:
+            summary_schedule["time"] = chat.summary_schedule.time
+        if chat.summary_schedule.mode == "weekly":
+            summary_schedule["weekday"] = chat.summary_schedule.weekday
+
+        chats.append(
+            {
+                "chat_id": chat.chat_id,
+                "alias": chat.alias,
+                "title": chat.title,
+                "groups": sorted(chat.groups),
+                "sources": sorted(chat.source_ids),
+                "enabled": chat.enabled,
+                "send_summary": chat.send_summary,
+                "delivery_mode": chat.delivery_mode,
+                "summary_on_startup": chat.summary_on_startup,
+                "summary_schedule": summary_schedule,
+            }
+        )
+
+    return {"admins": admins, "source_groups": source_groups, "chats": chats}
 
 
 def build_source_to_chat_map(sources: list[dict[str, Any]], routing: RoutingConfig) -> dict[str, list[str]]:
@@ -3454,6 +3506,57 @@ def import_routing_from_seed(config_path: str, db_path: str, *, replace: bool) -
     )
 
 
+def export_settings_to_yaml(config_path: str, db_path: str, export_path: str) -> None:
+    source_ids = load_source_ids(config_path)
+    with db_connect(db_path) as conn:
+        routing = load_routing_config_from_db(conn, source_ids)
+
+    path = Path(export_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            routing_config_to_yaml_data(routing),
+            f,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    LOG.info(
+        "settings exported to %s: admins=%d groups=%d chats=%d",
+        path,
+        len(routing.admins),
+        len(routing.source_groups),
+        len(routing.chats),
+    )
+
+
+def import_settings_from_yaml(config_path: str, db_path: str, import_path: str, *, replace: bool) -> None:
+    source_ids = load_source_ids(config_path)
+    routing = load_routing_config(import_path, source_ids)
+    with db_connect(db_path) as conn:
+        foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        try:
+            if replace:
+                conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("BEGIN")
+            import_routing_config_to_db(conn, routing, replace=replace, commit=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if replace:
+                conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
+    mode = "replaced" if replace else "merged"
+    LOG.info(
+        "settings %s from %s: admins=%d groups=%d chats=%d",
+        mode,
+        import_path,
+        len(routing.admins),
+        len(routing.source_groups),
+        len(routing.chats),
+    )
+
+
 def clear_summary_queue_rows(conn: sqlite3.Connection, chat_id: str | None = None) -> int:
     if chat_id:
         normalized_chat_id = normalize_chat_id(chat_id, "--chat-id")
@@ -3488,19 +3591,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-config", action="store_true", help="Validate local config and DB schema without network calls")
     parser.add_argument("--migrate-db", action="store_true", help="Allow --validate-config to migrate the real DB")
     parser.add_argument("--import-routing", action="store_true", help="Import routing seed from ROUTING_CONFIG_PATH")
-    parser.add_argument("--replace", action="store_true", help="Replace routing tables during --import-routing")
+    parser.add_argument("--export-settings", help="Export runtime routing settings to YAML")
+    parser.add_argument("--import-settings", help="Import runtime routing settings from YAML")
+    parser.add_argument("--replace", action="store_true", help="Replace routing tables during --import-routing or --import-settings")
     parser.add_argument("--clear-summary-queue", action="store_true", help="Clear digest summary queue without network calls")
     parser.add_argument("--chat-id", help="Limit --clear-summary-queue to one Telegram chat id")
     args = parser.parse_args()
 
     if args.migrate_db and not args.validate_config:
         parser.error("--migrate-db requires --validate-config")
-    if args.replace and not args.import_routing:
-        parser.error("--replace requires --import-routing")
+    if args.replace and not (args.import_routing or args.import_settings):
+        parser.error("--replace requires --import-routing or --import-settings")
     if args.chat_id and not args.clear_summary_queue:
         parser.error("--chat-id requires --clear-summary-queue")
-    if args.validate_config and (args.import_routing or args.clear_summary_queue):
-        parser.error("--validate-config cannot be combined with --import-routing or --clear-summary-queue")
+    if args.validate_config and (args.import_routing or args.export_settings or args.import_settings or args.clear_summary_queue):
+        parser.error("--validate-config cannot be combined with import/export/clear commands")
+    if args.import_routing and (args.export_settings or args.import_settings):
+        parser.error("--import-routing cannot be combined with --export-settings or --import-settings")
+    if args.export_settings and args.import_settings:
+        parser.error("--export-settings cannot be combined with --import-settings")
 
     return args
 
@@ -3515,6 +3624,14 @@ def main() -> None:
         return
     if args.import_routing:
         import_routing_from_seed(args.config, args.db, replace=args.replace)
+        if args.clear_summary_queue:
+            clear_summary_queue_command(args.db, args.chat_id)
+        return
+    if args.export_settings:
+        export_settings_to_yaml(args.config, args.db, args.export_settings)
+        return
+    if args.import_settings:
+        import_settings_from_yaml(args.config, args.db, args.import_settings, replace=args.replace)
         if args.clear_summary_queue:
             clear_summary_queue_command(args.db, args.chat_id)
         return

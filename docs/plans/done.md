@@ -31,3 +31,12 @@
 - Подтверждено решение: SQLite является runtime source-of-truth для Telegram-managed settings.
 - Подтверждено решение: YAML остается seed/backup/import/export слоем.
 - Подтверждено ограничение: provider/model keys и AI model config управляются только локально, не из Telegram.
+
+## Iteration 1: Settings Export/Import
+
+- Добавлен CLI `--export-settings <path>` для экспорта SQLite routing/settings в публичный YAML shape.
+- Добавлен CLI `--import-settings <path>` с validation against source ids from configured products config.
+- `--replace` теперь применим к `--import-settings` и явно заменяет routing/settings tables.
+- Export/import ограничен routing/settings tables; runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state` не экспортируются.
+- Restore выполняется транзакционно после валидации YAML.
+- Следующая итерация: runtime sources in SQLite.
