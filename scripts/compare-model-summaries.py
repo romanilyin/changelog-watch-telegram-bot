@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -33,6 +34,7 @@ import bot  # noqa: E402
 
 DEFAULT_MODELS_CONFIG = "scripts/model-summary-compare.local.yaml"
 DEFAULT_OUTPUT = "data/model-summary-comparison.md"
+DEFAULT_MODEL_LISTS_DIR = "data/model-lists"
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,9 @@ class ModelListing:
         flags = f" [{' '.join(self.flags)}]" if self.flags else ""
         label = f" — {self.label}" if self.label and self.label != self.model_id else ""
         return f"{self.model_id}{flags}{label}"
+
+    def to_json(self) -> dict[str, Any]:
+        return {"id": self.model_id, "flags": list(self.flags), "label": self.label}
 
 
 class RpmLimiter:
@@ -699,6 +704,63 @@ async def list_provider_models(providers: dict[str, ProviderConfig], selected_pr
                 print(listing.format_line())
 
 
+async def refresh_provider_model_lists(
+    providers: dict[str, ProviderConfig],
+    selected_providers: set[str],
+    output_dir: Path,
+) -> None:
+    if not providers:
+        raise ValueError("config has no providers")
+
+    provider_names = sorted(selected_providers or providers.keys())
+    unknown = [name for name in provider_names if name not in providers]
+    if unknown:
+        raise ValueError(f"unknown provider(s): {', '.join(unknown)}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for provider_name in provider_names:
+            provider = providers[provider_name]
+            txt_path = output_dir / f"{provider.name}.txt"
+            json_path = output_dir / f"{provider.name}.json"
+            print(f"[models] refreshing {provider.name} -> {txt_path}", flush=True)
+            try:
+                model_listings = await fetch_provider_model_ids(client, provider)
+                txt_lines = [f"# {provider.name} ({provider.api_base})"]
+                txt_lines.extend(listing.format_line() for listing in model_listings)
+                txt_path.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+                json_path.write_text(
+                    json.dumps(
+                        {
+                            "provider": provider.name,
+                            "api_base": provider.api_base,
+                            "models": [listing.to_json() for listing in model_listings],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                print(f"[models] wrote {len(model_listings)} model(s) for {provider.name}", flush=True)
+            except Exception as exc:
+                error_text = f"ERROR {type(exc).__name__}: {exc}"
+                txt_path.write_text(
+                    f"# {provider.name} ({provider.api_base})\n{error_text}\n",
+                    encoding="utf-8",
+                )
+                json_path.write_text(
+                    json.dumps(
+                        {"provider": provider.name, "api_base": provider.api_base, "error": error_text, "models": []},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                print(f"[models] {provider.name}: {error_text}", flush=True)
+
+
 def extract_content(data: Any) -> tuple[str | None, str | None, list[str]]:
     if not isinstance(data, dict):
         return None, None, []
@@ -879,6 +941,7 @@ async def run_comparison(
             for task in asyncio.as_completed(tasks):
                 release_key, model_title, summary = await task
                 results[(release_key, model_title)] = summary
+                print(f"  [done] {model_title}: {bot.truncate(summary, 140)}", flush=True)
     return results
 
 
@@ -894,6 +957,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=os.getenv("CONFIG_PATH", "products.yaml"), help="products.yaml path")
     parser.add_argument("--db", default=os.getenv("DB_PATH", "data/posted.sqlite3"), help="SQLite state DB path")
     parser.add_argument("--output", help=f"Markdown output path, default from config or {DEFAULT_OUTPUT}")
+    parser.add_argument("--model-lists-dir", default=DEFAULT_MODEL_LISTS_DIR, help="Directory for cached provider model lists")
     parser.add_argument("--limit", type=int, help="Number of recent releases to compare")
     parser.add_argument("--source-id", action="append", default=[], help="Limit releases to source id; repeatable")
     parser.add_argument("--item", action="append", default=[], help="Explicit release as source_id:item_id; repeatable")
@@ -902,6 +966,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrent-models", type=int, help="Concurrent model calls; default from config, otherwise 1")
     parser.add_argument("--chat-id", help="Select recent sent releases for one chat from deliveries")
     parser.add_argument("--list-provider-models", action="store_true", help="List model ids returned by configured providers")
+    parser.add_argument("--refresh-model-lists", action="store_true", help="Fetch provider model lists and write them to files")
     parser.add_argument("--list-items", action="store_true", help="Only list selected DB releases; no model calls")
     parser.add_argument("--dry-run", action="store_true", help="Show selected releases/models without calling model APIs")
     return parser.parse_args()
@@ -930,11 +995,15 @@ async def async_main() -> int:
             models_config_path,
             selected_models=set(args.model),
             require_keys=not args.dry_run and not args.list_items,
-            require_models=not args.list_provider_models,
+            require_models=not args.list_provider_models and not args.refresh_model_lists,
         )
 
     if args.list_provider_models:
         await list_provider_models(providers, set(args.provider))
+        return 0
+
+    if args.refresh_model_lists:
+        await refresh_provider_model_lists(providers, set(args.provider), resolve_path(args.model_lists_dir))
         return 0
 
     items_config = model_data.get("items", {}) if isinstance(model_data.get("items", {}), dict) else {}

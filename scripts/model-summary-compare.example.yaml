@@ -56,10 +56,12 @@ providers:
       X-Title: changelog-watch-telegram-bot
 
   ollama:
-    api_base: http://localhost:11434/v1
-    auth_type: none
-    rpm: 60
-    rate_limit_group: ollama
+    # Ollama Cloud OpenAI-compatible endpoint.
+    api_base: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY
+    auth_type: bearer
+    rpm: 10
+    rate_limit_group: ollama-cloud
 
 models:
   - name: zen-big-pickle
@@ -108,6 +110,6 @@ models:
   #   provider: openrouter
   #   model: qwen/qwen3-14b:free
   #
-  # - name: ollama-local
+  # - name: ollama-cloud-model
   #   provider: ollama
-  #   model: qwen3:14b
+  #   model: minimax-m2.5

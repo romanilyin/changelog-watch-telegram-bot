@@ -76,6 +76,15 @@ python scripts/compare-model-summaries.py --models-config scripts/model-summary-
 ```bash
 python scripts/compare-model-summaries.py --list-items --limit 10
 python scripts/compare-model-summaries.py --list-provider-models --models-config scripts/model-summary-compare.local.yaml
+python scripts/compare-model-summaries.py --refresh-model-lists --models-config scripts/model-summary-compare.local.yaml
 python scripts/compare-model-summaries.py --dry-run --models-config scripts/model-summary-compare.local.yaml
 python scripts/compare-model-summaries.py --item opencode_changelog:v1.15.5 --model zen-minimax-free
 ```
+
+Локальная web-админка читает сохранённые model lists из `data/model-lists/`, позволяет выбрать релизы и модели, запускает comparison job в фоне и показывает прогресс, логи и Markdown-результат:
+
+```bash
+python scripts/model-summary-admin.py --models-config scripts/model-summary-compare.local.yaml
+```
+
+По умолчанию UI доступен на `http://127.0.0.1:8765`. Jobs и результаты пишутся в `data/model-summary-admin/`.
