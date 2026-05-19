@@ -1,17 +1,40 @@
 # Current Iteration
 
-- [x] Добавлены dataclass-модели `ChatRouting`, `RoutingConfig`.
-- [x] Реализован загрузчик `load_routing_config` и нормализаторы ID.
-- [x] Построение карты `source -> chats` через `build_source_to_chat_map`.
-- [x] Подготовлен формат `admin-routing.yaml` (пример в `admin-routing.example.yaml`).
-- [x] Интегрировать routing state в runtime для отправки новых релизов.
-- [x] Убрать fallback-логику на `TELEGRAM_CHAT_ID` и `SUMMARY_CHAT_IDS` из кода и docs.
-- [x] Обновить документацию по деплою, install и переменным окружения.
-- [x] Добавить проверку доступа Telegram-бота к чатам из `admin-routing.yaml`.
-- [x] Добавить горячую перезагрузку routing state по TTL/сигналу.
-- [x] Добавить валидацию дублирующихся `chat_id` при чтении routing config.
-- [x] Добавить админские команды `/reload`, `/subscribe`, `/unsubscribe` через Telegram polling.
-- [x] Перевести `admin-routing.yaml` в SQLite-рутинг: seed из файла и хранение подписок/админов в `data/posted.sqlite3`.
-- [x] Добавить пер-чатовое расписание для сводок: `immediate`, `daily`, `weekly`.
-- [x] Добавить alias для чатов/админов и резолв `chat_id|alias` в командах.
-- [x] Реализовать очередь сводок `summary_queue` в `DB_PATH` для отложенной доставки.
+## Iteration 1: Settings Export/Import
+
+Цель: сделать переносимость runtime-настроек SQLite, чтобы Telegram-admin mode не привязывал настройки к одной машине.
+
+## Scope
+
+- Добавить CLI `--export-settings <path>`.
+- Добавить CLI `--import-settings <path>`.
+- Добавить `--replace` для import settings с явной заменой routing/settings таблиц.
+- Экспортировать только настройки:
+  - admins;
+  - source groups;
+  - chats;
+  - chat groups;
+  - chat source subscriptions.
+- Не экспортировать runtime/history state:
+  - `posted_items`;
+  - `deliveries`;
+  - `summary_queue`;
+  - `ai_summaries`;
+  - `source_state`.
+- Добавить validation path: импорт должен сначала прочитать YAML, сверить `source_id` с доступными source ids и только потом писать в SQLite.
+- Обновить docs с backup/restore сценариями.
+
+## Acceptance Checks
+
+- `python bot.py --validate-config`
+- `python bot.py --export-settings data/settings-export.test.yaml`
+- `python bot.py --import-settings data/settings-export.test.yaml --replace --db data/settings-import.test.sqlite3`
+- `python bot.py --validate-config --db data/settings-import.test.sqlite3 --migrate-db`
+- Проверить git diff и удалить временные test artifacts перед коммитом.
+
+## Out Of Scope
+
+- Перенос источников в SQLite.
+- Telegram-команды `/sources`, `/admins`, `/chats`.
+- Pending-flow для source/chat.
+- Изменение provider/model ключей и `ai-summary-models.local.yaml`.

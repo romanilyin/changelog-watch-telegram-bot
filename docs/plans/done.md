@@ -1,5 +1,7 @@
 # Done
 
+## Previous Runtime Routing Work
+
 - Добавлена разметка и форматирование Telegram-сообщений + префиксы сводки.
 - Собран каркас routing в `bot.py` с источником `products.yaml` + state из БД.
 - Добавлены вспомогательные нормализации для YAML-конфигураций.
@@ -23,3 +25,9 @@
   - `/subscribe <source_id> [chat_id|alias]`
   - `/unsubscribe <source_id> [chat_id|alias]`
 - Переведена routing-логика в SQLite с автоимпортом `admin-routing.yaml` как seed (`DB_PATH`).
+
+## Current Planning Baseline
+
+- Подтверждено решение: SQLite является runtime source-of-truth для Telegram-managed settings.
+- Подтверждено решение: YAML остается seed/backup/import/export слоем.
+- Подтверждено ограничение: provider/model keys и AI model config управляются только локально, не из Telegram.
