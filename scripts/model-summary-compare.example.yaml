@@ -3,6 +3,7 @@
 
 output: data/model-summary-comparison.md
 row_description_chars: 700
+concurrent_models: 1
 
 items:
   # Recent rows are selected from SQLite posted_items by default.
@@ -13,6 +14,9 @@ items:
   # chat_id: -1001234567890
 
 defaults:
+  auth_type: bearer
+  api_key_header: x-api-key
+  api_key_query_param: key
   target_language: ru
   max_input_chars: 6000
   max_output_chars: 220
@@ -22,28 +26,88 @@ defaults:
   rpm: 10
   max_attempts: 8
   rate_limit_wait_seconds: 60
+  max_retry_after_seconds: 300
+  models_path: /models
+  chat_completions_path: /chat/completions
+
+providers:
+  opencode-zen:
+    api_base: https://opencode.ai/zen/v1
+    api_key_env: AI_SUMMARY_API_KEY
+    auth_type: bearer
+    rpm: 5
+    rate_limit_group: opencode-zen
+
+  google:
+    # Gemini OpenAI-compatible endpoint.
+    api_base: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GOOGLE_API_KEY
+    auth_type: bearer
+    rpm: 5
+    rate_limit_group: google
+
+  openrouter:
+    api_base: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    auth_type: bearer
+    rpm: 10
+    rate_limit_group: openrouter
+    headers:
+      X-Title: changelog-watch-telegram-bot
+
+  ollama:
+    api_base: http://localhost:11434/v1
+    auth_type: none
+    rpm: 60
+    rate_limit_group: ollama
 
 models:
+  - name: zen-big-pickle
+    provider: opencode-zen
+    model: big-pickle
+
   - name: zen-minimax-free
-    api_base: https://opencode.ai/zen/v1
-    api_key_env: AI_SUMMARY_API_KEY
+    provider: opencode-zen
     model: minimax-m2.5-free
-    rpm: 5
-    rate_limit_group: opencode-zen
 
   - name: zen-deepseek-free
-    api_base: https://opencode.ai/zen/v1
-    api_key_env: AI_SUMMARY_API_KEY
+    provider: opencode-zen
     model: deepseek-v4-flash-free
-    rpm: 5
-    rate_limit_group: opencode-zen
+
+  - name: zen-gemini-flash
+    provider: opencode-zen
+    model: gemini-3-flash
+
+  - name: zen-nemotron-free
+    provider: opencode-zen
+    model: nemotron-3-super-free
 
   # Example for another OpenAI-compatible provider.
   # Put PROVIDER_API_KEY in your shell/.env or replace api_key_env with api_key
   # in the local ignored config.
+  #
+  # providers:
+  #   provider-account:
+  #     api_base: https://api.provider.example/v1
+  #     api_key_env: PROVIDER_API_KEY
+  #     rpm: 20
+  #     rate_limit_group: provider-account
+  #
   # - name: provider-model
-  #   api_base: https://api.provider.example/v1
-  #   api_key_env: PROVIDER_API_KEY
+  #   provider: provider-account
   #   model: provider/model-id
-  #   rpm: 20
-  #   rate_limit_group: provider-account
+  #   rpm: 10  # optional model-level override
+
+  # Examples for providers above. Uncomment in local config after checking
+  # exact ids with --list-provider-models.
+  # - name: google-gemini-flash
+  #   provider: google
+  #   model: gemini-2.5-flash
+  #
+  # - name: openrouter-free-model
+  #   provider: openrouter
+  #   model: qwen/qwen3-14b:free
+  #
+  # - name: ollama-local
+  #   provider: ollama
+  #   model: qwen3:14b

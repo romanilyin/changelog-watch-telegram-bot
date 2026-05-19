@@ -54,11 +54,34 @@ class ReleaseCase:
 
 
 @dataclass(frozen=True)
+class ProviderConfig:
+    name: str
+    api_base: str
+    api_key: str
+    auth_type: str
+    api_key_header: str
+    api_key_query_param: str
+    rpm: int
+    timeout_seconds: int
+    max_attempts: int
+    rate_limit_wait_seconds: float
+    max_retry_after_seconds: float
+    extra_headers: dict[str, str]
+    chat_completions_path: str
+    models_path: str
+    rate_limit_group: str
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     name: str
     model: str
+    provider_name: str | None
     api_base: str
     api_key: str
+    auth_type: str
+    api_key_header: str
+    api_key_query_param: str
     rpm: int
     rate_limit_group: str
     timeout_seconds: int
@@ -69,6 +92,7 @@ class ModelConfig:
     temperature: float
     max_attempts: int
     rate_limit_wait_seconds: float
+    max_retry_after_seconds: float
     extra_headers: dict[str, str]
     chat_completions_path: str = "/chat/completions"
 
@@ -77,25 +101,39 @@ class ModelConfig:
         return self.name or self.model
 
 
+@dataclass(frozen=True)
+class ModelListing:
+    model_id: str
+    flags: tuple[str, ...] = ()
+    label: str | None = None
+
+    def format_line(self) -> str:
+        flags = f" [{' '.join(self.flags)}]" if self.flags else ""
+        label = f" — {self.label}" if self.label and self.label != self.model_id else ""
+        return f"{self.model_id}{flags}{label}"
+
+
 class RpmLimiter:
     def __init__(self, rpm: int) -> None:
         self.rpm = max(1, int(rpm))
         self.timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
 
     async def wait(self) -> None:
-        now = monotonic()
-        while self.timestamps and now - self.timestamps[0] >= 60:
-            self.timestamps.popleft()
-
-        if len(self.timestamps) >= self.rpm:
-            delay = max(0.0, 60 - (now - self.timestamps[0])) + 0.1
-            print(f"[rpm] limit {self.rpm}/min reached, sleeping {delay:.1f}s", flush=True)
-            await asyncio.sleep(delay)
+        async with self._lock:
             now = monotonic()
             while self.timestamps and now - self.timestamps[0] >= 60:
                 self.timestamps.popleft()
 
-        self.timestamps.append(monotonic())
+            if len(self.timestamps) >= self.rpm:
+                delay = max(0.0, 60 - (now - self.timestamps[0])) + 0.1
+                print(f"[rpm] limit {self.rpm}/min reached, sleeping {delay:.1f}s", flush=True)
+                await asyncio.sleep(delay)
+                now = monotonic()
+                while self.timestamps and now - self.timestamps[0] >= 60:
+                    self.timestamps.popleft()
+
+            self.timestamps.append(monotonic())
 
 
 def read_yaml(path: Path) -> dict[str, Any]:
@@ -138,6 +176,36 @@ def as_str_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def config_value(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def read_object(value: Any, context: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be an object")
+    return value
+
+
+def merge_headers(*values: Any) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError("headers must be an object")
+        for key, header_value in value.items():
+            merged[str(key)] = str(header_value)
+    return merged
+
+
 def parse_item_filter(raw_item: str) -> tuple[str, str]:
     if ":" not in raw_item:
         raise ValueError(f"item must look like source_id:item_id, got {raw_item!r}")
@@ -149,31 +217,118 @@ def parse_item_filter(raw_item: str) -> tuple[str, str]:
     return source_id, item_id
 
 
-def pick_api_key(raw_model: dict[str, Any], *, require_key: bool) -> str:
-    api_key = str(raw_model.get("api_key") or "").strip()
-    api_key_env = str(raw_model.get("api_key_env") or "").strip()
+def pick_api_key(raw_config: dict[str, Any], *, require_key: bool, context: str) -> str:
+    api_key = str(raw_config.get("api_key") or "").strip()
+    api_key_env = str(raw_config.get("api_key_env") or "").strip()
     if not api_key and api_key_env:
         api_key = os.getenv(api_key_env, "").strip()
     if require_key and not api_key:
-        name = raw_model.get("name") or raw_model.get("model") or "<unnamed>"
-        raise ValueError(f"model {name!r} has no api_key and api_key_env is empty")
+        raise ValueError(f"{context} has no api_key and api_key_env is empty")
     return api_key
 
 
-def load_model_configs(config_path: Path, *, selected_models: set[str], require_keys: bool) -> tuple[list[ModelConfig], dict[str, Any]]:
+def normalize_auth_type(value: Any) -> str:
+    auth_type = str(value or "bearer").strip().lower().replace("_", "-")
+    if auth_type in {"bearer", "api-key", "query-key", "none"}:
+        return auth_type
+    raise ValueError(f"auth_type must be one of bearer|api-key|query-key|none, got {auth_type!r}")
+
+
+def build_auth_request_parts(config: Any, *, content_type: str | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    headers = dict(getattr(config, "extra_headers", {}) or {})
+    params: dict[str, str] = {}
+    api_key = str(getattr(config, "api_key", "") or "").strip()
+    auth_type = normalize_auth_type(getattr(config, "auth_type", "bearer"))
+
+    if content_type:
+        headers.setdefault("Content-Type", content_type)
+
+    if auth_type == "bearer" and api_key:
+        headers.setdefault("Authorization", f"Bearer {api_key}")
+    elif auth_type == "api-key" and api_key:
+        header_name = str(getattr(config, "api_key_header", "x-api-key") or "x-api-key")
+        headers.setdefault(header_name, api_key)
+    elif auth_type == "query-key" and api_key:
+        param_name = str(getattr(config, "api_key_query_param", "key") or "key")
+        params[param_name] = api_key
+
+    return headers, params
+
+
+def auth_requires_key(auth_type: str) -> bool:
+    return normalize_auth_type(auth_type) != "none"
+
+
+def load_provider_configs(
+    data: dict[str, Any],
+    defaults: dict[str, Any],
+    *,
+    require_keys: bool,
+) -> dict[str, ProviderConfig]:
+    raw_providers = data.get("providers", {})
+    if raw_providers is None:
+        raw_providers = {}
+    if not isinstance(raw_providers, dict):
+        raise ValueError("providers must be an object keyed by provider name")
+
+    providers: dict[str, ProviderConfig] = {}
+    for provider_name, raw_provider_value in raw_providers.items():
+        name = str(provider_name).strip()
+        if not name:
+            raise ValueError("provider name must be non-empty")
+        raw_provider = read_object(raw_provider_value, f"providers.{name}")
+        api_base = str(config_value(raw_provider.get("api_base"), defaults.get("api_base")) or "").strip().rstrip("/")
+        if not api_base:
+            raise ValueError(f"provider {name!r} requires api_base")
+
+        providers[name] = ProviderConfig(
+            name=name,
+            api_base=api_base,
+            api_key=pick_api_key(raw_provider, require_key=False, context=f"provider {name!r}"),
+            auth_type=normalize_auth_type(config_value(raw_provider.get("auth_type"), defaults.get("auth_type"), "bearer")),
+            api_key_header=str(config_value(raw_provider.get("api_key_header"), defaults.get("api_key_header"), "x-api-key")),
+            api_key_query_param=str(config_value(raw_provider.get("api_key_query_param"), defaults.get("api_key_query_param"), "key")),
+            rpm=as_int(config_value(raw_provider.get("rpm"), defaults.get("rpm")), 10),
+            timeout_seconds=as_int(config_value(raw_provider.get("timeout_seconds"), defaults.get("timeout_seconds")), 60),
+            max_attempts=as_int(config_value(raw_provider.get("max_attempts"), defaults.get("max_attempts")), 8),
+            rate_limit_wait_seconds=as_float(
+                config_value(raw_provider.get("rate_limit_wait_seconds"), defaults.get("rate_limit_wait_seconds")),
+                60.0,
+            ),
+            max_retry_after_seconds=as_float(
+                config_value(raw_provider.get("max_retry_after_seconds"), defaults.get("max_retry_after_seconds")),
+                300.0,
+            ),
+            extra_headers=merge_headers(defaults.get("headers"), raw_provider.get("headers")),
+            chat_completions_path=normalize_api_path(
+                config_value(raw_provider.get("chat_completions_path"), defaults.get("chat_completions_path"), "/chat/completions")
+            ),
+            models_path=normalize_api_path(config_value(raw_provider.get("models_path"), defaults.get("models_path"), "/models")),
+            rate_limit_group=str(raw_provider.get("rate_limit_group") or name).strip() or name,
+        )
+    return providers
+
+
+def load_model_configs(
+    config_path: Path,
+    *,
+    selected_models: set[str],
+    require_keys: bool,
+    require_models: bool = True,
+) -> tuple[dict[str, ProviderConfig], list[ModelConfig], dict[str, Any], int]:
     data = read_yaml(config_path)
     env_file = str(data.get("env_file") or "").strip()
     if env_file:
         load_dotenv(resolve_path(env_file, base_dir=config_path.parent), override=True)
 
-    defaults = data.get("defaults", {})
-    if defaults is None:
-        defaults = {}
-    if not isinstance(defaults, dict):
-        raise ValueError("defaults must be an object")
+    defaults = read_object(data.get("defaults", {}), "defaults")
+    providers = load_provider_configs(data, defaults, require_keys=require_keys)
+    concurrent_models = as_int(config_value(data.get("concurrent_models"), defaults.get("concurrent_models")), 1)
 
     raw_models = data.get("models", [])
-    if not isinstance(raw_models, list) or not raw_models:
+    if not isinstance(raw_models, list):
+        raise ValueError("models config must contain a models list")
+    if require_models and not raw_models:
         raise ValueError("models config must contain a non-empty models list")
 
     models: list[ModelConfig] = []
@@ -185,21 +340,30 @@ def load_model_configs(config_path: Path, *, selected_models: set[str], require_
         if not model:
             raise ValueError(f"models[{index}].model is required")
         name = str(raw_model.get("name") or model).strip()
+        provider_name = str(raw_model.get("provider") or "").strip() or None
+        provider = providers.get(provider_name) if provider_name else None
+        if provider_name and provider is None:
+            raise ValueError(f"model {name!r} references unknown provider {provider_name!r}")
 
         if selected_models and name not in selected_models and model not in selected_models:
             continue
 
-        api_base = str(raw_model.get("api_base") or defaults.get("api_base") or "").strip().rstrip("/")
+        api_base = str(config_value(raw_model.get("api_base"), provider.api_base if provider else None, defaults.get("api_base")) or "").strip().rstrip("/")
         if not api_base:
-            raise ValueError(f"model {name!r} requires api_base")
+            raise ValueError(f"model {name!r} requires provider or api_base")
 
-        extra_headers = raw_model.get("headers") or defaults.get("headers") or {}
-        if not isinstance(extra_headers, dict):
-            raise ValueError(f"model {name!r} headers must be an object")
+        model_api_key = pick_api_key(raw_model, require_key=False, context=f"model {name!r}")
+        api_key = model_api_key or (provider.api_key if provider else "")
+        auth_type = normalize_auth_type(config_value(raw_model.get("auth_type"), provider.auth_type if provider else None, defaults.get("auth_type"), "bearer"))
+        if require_keys and auth_requires_key(auth_type) and not api_key:
+            raise ValueError(f"model {name!r} has no api_key/api_key_env and provider has no key")
 
-        max_output_chars = as_int(raw_model.get("max_output_chars", defaults.get("max_output_chars")), 220)
+        max_output_chars = as_int(
+            config_value(raw_model.get("max_output_chars"), defaults.get("max_output_chars")),
+            220,
+        )
         max_tokens = as_int(
-            raw_model.get("max_tokens", defaults.get("max_tokens")),
+            config_value(raw_model.get("max_tokens"), defaults.get("max_tokens")),
             max(max_output_chars * 6, 1000),
         )
 
@@ -207,31 +371,72 @@ def load_model_configs(config_path: Path, *, selected_models: set[str], require_
             ModelConfig(
                 name=name,
                 model=model,
+                provider_name=provider.name if provider else provider_name,
                 api_base=api_base,
-                api_key=pick_api_key(raw_model, require_key=require_keys),
-                rpm=as_int(raw_model.get("rpm", defaults.get("rpm")), 10),
-                rate_limit_group=str(raw_model.get("rate_limit_group") or raw_model.get("provider") or name).strip() or name,
-                timeout_seconds=as_int(raw_model.get("timeout_seconds", defaults.get("timeout_seconds")), 60),
+                api_key=api_key,
+                auth_type=auth_type,
+                api_key_header=str(
+                    config_value(raw_model.get("api_key_header"), provider.api_key_header if provider else None, defaults.get("api_key_header"), "x-api-key")
+                ),
+                api_key_query_param=str(
+                    config_value(
+                        raw_model.get("api_key_query_param"),
+                        provider.api_key_query_param if provider else None,
+                        defaults.get("api_key_query_param"),
+                        "key",
+                    )
+                ),
+                rpm=as_int(config_value(raw_model.get("rpm"), provider.rpm if provider else None, defaults.get("rpm")), 10),
+                rate_limit_group=str(
+                    raw_model.get("rate_limit_group")
+                    or (provider.rate_limit_group if provider else None)
+                    or provider_name
+                    or name
+                ).strip() or name,
+                timeout_seconds=as_int(
+                    config_value(raw_model.get("timeout_seconds"), provider.timeout_seconds if provider else None, defaults.get("timeout_seconds")),
+                    60,
+                ),
                 max_tokens=max_tokens,
                 max_output_chars=max_output_chars,
-                max_input_chars=as_int(raw_model.get("max_input_chars", defaults.get("max_input_chars")), 6000),
-                target_language=str(raw_model.get("target_language", defaults.get("target_language", "ru"))).strip() or "ru",
-                temperature=as_float(raw_model.get("temperature", defaults.get("temperature")), 0.2),
-                max_attempts=as_int(raw_model.get("max_attempts", defaults.get("max_attempts")), 8),
+                max_input_chars=as_int(config_value(raw_model.get("max_input_chars"), defaults.get("max_input_chars")), 6000),
+                target_language=str(config_value(raw_model.get("target_language"), defaults.get("target_language"), "ru")).strip() or "ru",
+                temperature=as_float(config_value(raw_model.get("temperature"), defaults.get("temperature")), 0.2),
+                max_attempts=as_int(
+                    config_value(raw_model.get("max_attempts"), provider.max_attempts if provider else None, defaults.get("max_attempts")),
+                    8,
+                ),
                 rate_limit_wait_seconds=as_float(
-                    raw_model.get("rate_limit_wait_seconds", defaults.get("rate_limit_wait_seconds")),
+                    config_value(
+                        raw_model.get("rate_limit_wait_seconds"),
+                        provider.rate_limit_wait_seconds if provider else None,
+                        defaults.get("rate_limit_wait_seconds"),
+                    ),
                     60.0,
                 ),
-                extra_headers={str(key): str(value) for key, value in extra_headers.items()},
+                max_retry_after_seconds=as_float(
+                    config_value(
+                        raw_model.get("max_retry_after_seconds"),
+                        provider.max_retry_after_seconds if provider else None,
+                        defaults.get("max_retry_after_seconds"),
+                    ),
+                    300.0,
+                ),
+                extra_headers=merge_headers(defaults.get("headers"), provider.extra_headers if provider else None, raw_model.get("headers")),
                 chat_completions_path=normalize_api_path(
-                    raw_model.get("chat_completions_path", defaults.get("chat_completions_path", "/chat/completions"))
+                    config_value(
+                        raw_model.get("chat_completions_path"),
+                        provider.chat_completions_path if provider else None,
+                        defaults.get("chat_completions_path"),
+                        "/chat/completions",
+                    )
                 ),
             )
         )
 
     if selected_models and not models:
         raise ValueError(f"selected model(s) not found: {', '.join(sorted(selected_models))}")
-    return models, data
+    return providers, models, data, concurrent_models
 
 
 def normalize_api_path(value: Any) -> str:
@@ -368,6 +573,132 @@ def parse_retry_after(response: httpx.Response, fallback_seconds: float) -> floa
     return fallback_seconds
 
 
+def value_is_zero(value: Any) -> bool:
+    try:
+        return float(str(value).strip()) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def model_looks_free(item: Any, model_id: str) -> bool:
+    lowered_id = model_id.lower()
+    if lowered_id.endswith(":free") or lowered_id.endswith("-free") or ":free/" in lowered_id:
+        return True
+    if not isinstance(item, dict):
+        return False
+
+    for key in ("free", "is_free", "free_tier"):
+        value = item.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "free"}:
+            return True
+
+    pricing = item.get("pricing")
+    if isinstance(pricing, dict):
+        price_values = [pricing.get(key) for key in ("prompt", "completion", "request", "input", "output")]
+        present_values = [value for value in price_values if value is not None]
+        if present_values and all(value_is_zero(value) for value in present_values):
+            return True
+
+    return False
+
+
+def model_looks_local(provider: ProviderConfig) -> bool:
+    api_base = provider.api_base.lower()
+    return provider.auth_type == "none" and (
+        "localhost" in api_base or "127.0.0.1" in api_base or "host.docker.internal" in api_base
+    )
+
+
+def extract_model_listings(data: Any, provider: ProviderConfig) -> list[ModelListing]:
+    if isinstance(data, dict):
+        raw_models = data.get("data") or data.get("models") or data.get("items") or []
+    else:
+        raw_models = data
+
+    if not isinstance(raw_models, list):
+        return []
+
+    listings: list[ModelListing] = []
+    for item in raw_models:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
+            label = item.get("name") or item.get("display_name") or item.get("description")
+        else:
+            model_id = item
+            label = None
+        model_text = str(model_id or "").strip()
+        if model_text:
+            flags: list[str] = []
+            if model_looks_free(item, model_text):
+                flags.append("FREE")
+            if model_looks_local(provider):
+                flags.append("LOCAL")
+            listings.append(ModelListing(model_id=model_text, flags=tuple(flags), label=str(label).strip() if label else None))
+
+    unique: dict[str, ModelListing] = {}
+    for listing in listings:
+        unique.setdefault(listing.model_id, listing)
+    return sorted(unique.values(), key=lambda listing: listing.model_id)
+
+
+async def fetch_provider_model_ids(client: httpx.AsyncClient, provider: ProviderConfig) -> list[ModelListing]:
+    api_url = f"{provider.api_base}{provider.models_path}"
+    if auth_requires_key(provider.auth_type) and not provider.api_key:
+        raise ValueError("provider requires an API key")
+    headers, params = build_auth_request_parts(provider)
+    headers.setdefault("Accept", "application/json")
+    limiter = RpmLimiter(provider.rpm)
+
+    for attempt in range(1, provider.max_attempts + 1):
+        await limiter.wait()
+        response = await client.get(api_url, headers=headers, params=params, timeout=provider.timeout_seconds)
+        if response.status_code == 429:
+            delay = parse_retry_after(response, provider.rate_limit_wait_seconds)
+            if delay > provider.max_retry_after_seconds:
+                raise RuntimeError(f"rate limited; retry_after={delay:.1f}s; {compact_error(response.text)}")
+            print(
+                f"[{provider.name}] 429 while listing models, sleeping {delay:.1f}s "
+                f"(attempt {attempt}/{provider.max_attempts})",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+            continue
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {compact_error(response.text)}")
+
+        return extract_model_listings(response.json(), provider)
+
+    raise RuntimeError(f"rate limit after {provider.max_attempts} attempts")
+
+
+async def list_provider_models(providers: dict[str, ProviderConfig], selected_providers: set[str]) -> None:
+    if not providers:
+        raise ValueError("config has no providers")
+
+    provider_names = sorted(selected_providers or providers.keys())
+    unknown = [name for name in provider_names if name not in providers]
+    if unknown:
+        raise ValueError(f"unknown provider(s): {', '.join(unknown)}")
+
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for provider_name in provider_names:
+            provider = providers[provider_name]
+            print(f"# {provider.name} ({provider.api_base})")
+            try:
+                model_listings = await fetch_provider_model_ids(client, provider)
+            except Exception as exc:
+                print(f"ERROR {type(exc).__name__}: {exc}")
+                continue
+
+            if not model_listings:
+                print("<no models returned>")
+                continue
+            for listing in model_listings:
+                print(listing.format_line())
+
+
 def extract_content(data: Any) -> tuple[str | None, str | None, list[str]]:
     if not isinstance(data, dict):
         return None, None, []
@@ -413,11 +744,9 @@ async def generate_summary(
     limiter: RpmLimiter,
 ) -> str:
     api_url = f"{model.api_base}{model.chat_completions_path}"
-    headers = {
-        "Authorization": f"Bearer {model.api_key}",
-        "Content-Type": "application/json",
-        **model.extra_headers,
-    }
+    if auth_requires_key(model.auth_type) and not model.api_key:
+        return "ERROR missing API key"
+    headers, params = build_auth_request_parts(model, content_type="application/json")
     payload = {
         "model": model.model,
         "stream": False,
@@ -429,7 +758,7 @@ async def generate_summary(
     for attempt in range(1, model.max_attempts + 1):
         await limiter.wait()
         try:
-            response = await client.post(api_url, headers=headers, json=payload, timeout=model.timeout_seconds)
+            response = await client.post(api_url, headers=headers, params=params, json=payload, timeout=model.timeout_seconds)
         except Exception as exc:
             if attempt >= model.max_attempts:
                 return f"ERROR request: {type(exc).__name__}: {exc}"
@@ -440,6 +769,8 @@ async def generate_summary(
 
         if response.status_code == 429:
             delay = parse_retry_after(response, model.rate_limit_wait_seconds)
+            if delay > model.max_retry_after_seconds:
+                return f"RATE_LIMIT retry_after={delay:.1f}s: {compact_error(response.text)}"
             print(
                 f"[{model.column_title}] 429 rate limit on {release.key[0]}:{release.key[1]}, "
                 f"sleeping {delay:.1f}s (attempt {attempt}/{model.max_attempts})",
@@ -523,6 +854,8 @@ def build_markdown_table(
 async def run_comparison(
     releases: list[ReleaseCase],
     models: list[ModelConfig],
+    *,
+    concurrent_models: int,
 ) -> dict[tuple[tuple[str, str], str], str]:
     results: dict[tuple[tuple[str, str], str], str] = {}
     limiters: dict[str, RpmLimiter] = {}
@@ -530,13 +863,22 @@ async def run_comparison(
         existing = limiters.get(model.rate_limit_group)
         if existing is None or model.rpm < existing.rpm:
             limiters[model.rate_limit_group] = RpmLimiter(model.rpm)
+
+    semaphore = asyncio.Semaphore(max(1, concurrent_models))
+
+    async def run_one(client: httpx.AsyncClient, release: ReleaseCase, model: ModelConfig) -> tuple[tuple[str, str], str, str]:
+        async with semaphore:
+            print(f"  [model] {model.column_title}", flush=True)
+            summary = await generate_summary(client, model, release, limiters[model.rate_limit_group])
+            return release.key, model.column_title, summary
+
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         for release in releases:
             print(f"[release] {release.key[0]}:{release.key[1]}", flush=True)
-            for model in models:
-                print(f"  [model] {model.column_title}", flush=True)
-                summary = await generate_summary(client, model, release, limiters[model.rate_limit_group])
-                results[(release.key, model.column_title)] = summary
+            tasks = [asyncio.create_task(run_one(client, release, model)) for model in models]
+            for task in asyncio.as_completed(tasks):
+                release_key, model_title, summary = await task
+                results[(release_key, model_title)] = summary
     return results
 
 
@@ -556,7 +898,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-id", action="append", default=[], help="Limit releases to source id; repeatable")
     parser.add_argument("--item", action="append", default=[], help="Explicit release as source_id:item_id; repeatable")
     parser.add_argument("--model", action="append", default=[], help="Run only model name/id from config; repeatable")
+    parser.add_argument("--provider", action="append", default=[], help="Provider name for --list-provider-models; repeatable")
+    parser.add_argument("--concurrent-models", type=int, help="Concurrent model calls; default from config, otherwise 1")
     parser.add_argument("--chat-id", help="Select recent sent releases for one chat from deliveries")
+    parser.add_argument("--list-provider-models", action="store_true", help="List model ids returned by configured providers")
     parser.add_argument("--list-items", action="store_true", help="Only list selected DB releases; no model calls")
     parser.add_argument("--dry-run", action="store_true", help="Show selected releases/models without calling model APIs")
     return parser.parse_args()
@@ -577,13 +922,20 @@ async def async_main() -> int:
         return 2
 
     model_data: dict[str, Any] = {}
+    providers: dict[str, ProviderConfig] = {}
     models: list[ModelConfig] = []
+    config_concurrent_models = 1
     if models_config_path.exists():
-        models, model_data = load_model_configs(
+        providers, models, model_data, config_concurrent_models = load_model_configs(
             models_config_path,
             selected_models=set(args.model),
             require_keys=not args.dry_run and not args.list_items,
+            require_models=not args.list_provider_models,
         )
+
+    if args.list_provider_models:
+        await list_provider_models(providers, set(args.provider))
+        return 0
 
     items_config = model_data.get("items", {}) if isinstance(model_data.get("items", {}), dict) else {}
     default_limit = as_int(items_config.get("limit"), 5)
@@ -611,15 +963,26 @@ async def async_main() -> int:
     if args.dry_run:
         print("Selected releases:")
         print_release_list(releases)
+        concurrent_models = args.concurrent_models if args.concurrent_models and args.concurrent_models > 0 else config_concurrent_models
+        print(f"Concurrent models: {concurrent_models}")
+        if providers:
+            print("Configured providers:")
+            for provider in providers.values():
+                print(f"{provider.name} | rpm={provider.rpm} | api_base={provider.api_base}")
         print("Selected models:")
         for model in models:
-            print(f"{model.column_title} | {model.model} | rpm={model.rpm} | api_base={model.api_base}")
+            provider_label = model.provider_name or "<model override>"
+            print(
+                f"{model.column_title} | {model.model} | provider={provider_label} | "
+                f"rpm={model.rpm} | api_base={model.api_base}"
+            )
         return 0
 
     row_description_chars = as_int(model_data.get("row_description_chars"), 700)
     output_path = resolve_path(str(args.output or model_data.get("output") or DEFAULT_OUTPUT))
 
-    results = await run_comparison(releases, models)
+    concurrent_models = args.concurrent_models if args.concurrent_models and args.concurrent_models > 0 else config_concurrent_models
+    results = await run_comparison(releases, models, concurrent_models=concurrent_models)
     output = build_markdown_table(
         releases,
         models,

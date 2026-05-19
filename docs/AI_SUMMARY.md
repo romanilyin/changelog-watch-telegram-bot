@@ -65,12 +65,17 @@ cp scripts/model-summary-compare.example.yaml scripts/model-summary-compare.loca
 python scripts/compare-model-summaries.py --models-config scripts/model-summary-compare.local.yaml --limit 5
 ```
 
-Скрипт берёт recent release ids из SQLite (`posted_items`, либо `deliveries` при `chat_id`), восстанавливает release notes через источники из `products.yaml`, вызывает модели из отдельного YAML-конфига и пишет Markdown-таблицу. `*.local.yaml` игнорируется git, поэтому ключи держи там или через `api_key_env`. Для общего RPM-лимита провайдера укажи одинаковый `rate_limit_group` у нескольких моделей.
+Скрипт берёт recent release ids из SQLite (`posted_items`, либо `deliveries` при `chat_id`), восстанавливает release notes через источники из `products.yaml`, вызывает модели из отдельного YAML-конфига и пишет Markdown-таблицу. `*.local.yaml` игнорируется git, поэтому ключи держи там или через `api_key_env`.
+
+Конфиг поддерживает `providers`: модель может указать `provider: opencode-zen` и унаследовать `api_base`, `auth_type`, `api_key_env`/`api_key`, `rpm`, `models_path`, `chat_completions_path` и retry-настройки. Любое из этих полей можно переопределить на уровне конкретной модели. `concurrent_models` по умолчанию равен `1`; его можно переопределить в YAML или через `--concurrent-models`.
+
+Поддержанные типы авторизации: `bearer`, `api-key`, `query-key`, `none`. В example config уже есть провайдеры `opencode-zen`, `google`, `openrouter`, `ollama`. Команда `--list-provider-models` выводит id моделей и помечает `FREE`/`LOCAL`, когда это можно определить из ответа провайдера или имени модели.
 
 Полезные режимы:
 
 ```bash
 python scripts/compare-model-summaries.py --list-items --limit 10
+python scripts/compare-model-summaries.py --list-provider-models --models-config scripts/model-summary-compare.local.yaml
 python scripts/compare-model-summaries.py --dry-run --models-config scripts/model-summary-compare.local.yaml
 python scripts/compare-model-summaries.py --item opencode_changelog:v1.15.5 --model zen-minimax-free
 ```
