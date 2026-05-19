@@ -1,0 +1,86 @@
+# Copy to ai-summary-models.local.yaml and set AI_SUMMARY_MODELS_CONFIG=ai-summary-models.local.yaml.
+# *.local.yaml is ignored by git. Keep API keys in .env and reference them via api_key_env.
+
+env_file: .env
+
+defaults:
+  auth_type: bearer
+  api_key_header: x-api-key
+  api_key_query_param: key
+  target_language: ru
+  max_input_chars: 6000
+  max_output_chars: 440
+  max_tokens: 10000
+  temperature: 0.2
+  timeout_seconds: 60
+  rpm: 5
+  max_attempts: 8
+  rate_limit_wait_seconds: 30
+  max_retry_after_seconds: 120
+  rate_limit_total_wait_seconds: 120
+  chat_completions_path: /chat/completions
+
+providers:
+  google:
+    api_base: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GOOGLE_API_KEY
+    auth_type: bearer
+    rpm: 5
+    rate_limit_group: google
+    # Manual Google AI Studio limits captured during model comparison.
+    model_limits:
+      gemini-2.5-flash-lite:
+        category: Text-out models
+        rpm: 10
+        tpm: 250000
+        rpd: 20
+
+  ollama:
+    api_base: https://ollama.com/v1
+    api_key_env: OLLAMA_API_KEY
+    auth_type: bearer
+    rpm: 120
+    rate_limit_group: ollama-cloud
+    concurrent_requests: 1
+
+  openrouter:
+    api_base: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    auth_type: bearer
+    rpm: 120
+    rate_limit_group: openrouter
+    headers:
+      X-Title: changelog-watch-telegram-bot
+
+models:
+  - name: google-gemini-2-5-flash-lite
+    provider: google
+    model: gemini-2.5-flash-lite
+
+  - name: ollama-devstral-small-2-24b
+    provider: ollama
+    model: devstral-small-2:24b
+
+  - name: ollama-devstral-2-123b
+    provider: ollama
+    model: devstral-2:123b
+
+  - name: openrouter-openai-gpt-oss-20b-free
+    provider: openrouter
+    model: openai/gpt-oss-20b:free
+
+  - name: ollama-qwen3-coder-next
+    provider: ollama
+    model: qwen3-coder-next
+
+  - name: ollama-qwen3-vl-235b-instruct
+    provider: ollama
+    model: qwen3-vl:235b-instruct
+
+  - name: ollama-ministral-3-14b
+    provider: ollama
+    model: ministral-3:14b
+
+  - name: ollama-ministral-3-8b
+    provider: ollama
+    model: ministral-3:8b

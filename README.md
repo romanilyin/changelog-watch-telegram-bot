@@ -60,8 +60,10 @@ Windows PowerShell 7 + WSL:
 - `bot.py` — основной бот и CLI.
 - `products.yaml` — seed/backup список источников и `poll_minutes`.
 - `admin-routing.yaml` — seed-файл routing-настроек.
+- `ai-summary-models.local.yaml` — локальный ordered provider/model fallback для AI summary.
 - `.env` — runtime-настройки.
 - `data/posted.sqlite3` — runtime sources, routing, состояние публикаций, очереди digest и AI cache.
+- `icon_watcher.png` — иконка/branding для бота.
 - `check-dry-run-no-write.sh` — ручная проверка, что dry-run не меняет SQLite.
 
 ## Настройки

@@ -33,7 +33,9 @@ import bot  # noqa: E402
 
 DEFAULT_MODELS_CONFIG = "scripts/model-summary-compare.local.yaml"
 DEFAULT_MODEL_LISTS_DIR = "data/model-lists"
+DEFAULT_MODEL_DECISIONS = "data/model-decisions.yaml"
 DEFAULT_JOBS_DIR = "data/model-summary-admin"
+HIDDEN_MODEL_ACTIONS = {"skip", "retry_later"}
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -60,6 +62,31 @@ def load_base_config(path: Path) -> dict[str, Any]:
     if env_file:
         load_dotenv(resolve_path(str(path.parent / env_file)), override=True)
     return data
+
+
+def normalize_decision_model_id(provider_name: str, model_id: str) -> str:
+    if provider_name == "google" and model_id.startswith("models/"):
+        return model_id.split("/", 1)[1]
+    return model_id
+
+
+def model_decision_key(provider_name: str, model_id: str) -> str:
+    return f"{provider_name}:{normalize_decision_model_id(provider_name, model_id)}"
+
+
+def load_model_decisions(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    data = read_yaml(path)
+    raw_models = data.get("models", {})
+    if not isinstance(raw_models, dict):
+        return {}
+    return {str(key): value for key, value in raw_models.items() if isinstance(value, dict)}
+
+
+def decision_hides_model(decision: dict[str, Any] | None) -> bool:
+    action = str((decision or {}).get("action") or "").strip().lower()
+    return action in HIDDEN_MODEL_ACTIONS
 
 
 def read_recent_rows(db_path: Path, limit: int) -> list[dict[str, str]]:
@@ -148,7 +175,7 @@ def parse_model_line(line: str) -> dict[str, Any] | None:
         return None
     model_part, _, label = line.partition(" — ")
     flags: list[str] = []
-    match = re.search(r"\s+\[([A-Z ]+)\]$", model_part)
+    match = re.search(r"\s+\[([0-9A-Z_ -]+)\]$", model_part)
     if match:
         flags = [flag for flag in match.group(1).split() if flag]
         model_part = model_part[: match.start()].strip()
@@ -157,7 +184,13 @@ def parse_model_line(line: str) -> dict[str, Any] | None:
     return {"id": model_part, "flags": flags, "label": label.strip() or None, "line": line}
 
 
-def read_model_lists(model_lists_dir: Path, providers: dict[str, Any]) -> list[dict[str, Any]]:
+def read_model_lists(
+    model_lists_dir: Path,
+    providers: dict[str, Any],
+    decisions: dict[str, dict[str, Any]],
+    *,
+    include_hidden_models: bool,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     provider_names = sorted(providers.keys() | {path.stem for path in model_lists_dir.glob("*.txt")})
     for provider_name in provider_names:
@@ -170,6 +203,9 @@ def read_model_lists(model_lists_dir: Path, providers: dict[str, Any]) -> list[d
                     error = line
                 parsed = parse_model_line(line)
                 if parsed:
+                    decision = decisions.get(model_decision_key(provider_name, str(parsed["id"])))
+                    if decision_hides_model(decision) and not include_hidden_models:
+                        continue
                     models.append(parsed)
         result.append({"name": provider_name, "models": models, "error": error, "path": str(txt_path)})
     return result
@@ -397,7 +433,12 @@ class AdminHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 limit = int((query.get("limit") or ["30"])[0])
                 releases = asyncio.run(resolve_release_options(self.server.products_config, self.server.db_path, limit))
-                providers = read_model_lists(self.server.model_lists_dir, self.server.base_config.get("providers", {}))
+                providers = read_model_lists(
+                    self.server.model_lists_dir,
+                    self.server.base_config.get("providers", {}),
+                    self.server.model_decisions,
+                    include_hidden_models=self.server.include_hidden_models,
+                )
                 self.send_json({"releases": releases, "providers": providers})
                 return
             if parsed.path == "/api/jobs":
@@ -488,6 +529,8 @@ class AdminServer(ThreadingHTTPServer):
         self.products_config = resolve_path(args.config)
         self.db_path = resolve_path(args.db)
         self.model_lists_dir = resolve_path(args.model_lists_dir)
+        self.model_decisions = load_model_decisions(resolve_path(args.model_decisions))
+        self.include_hidden_models = bool(args.include_hidden_models)
         self.jobs_dir = resolve_path(args.jobs_dir)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.compare_script = PROJECT_ROOT / "scripts" / "compare-model-summaries.py"
@@ -501,6 +544,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--models-config", default=DEFAULT_MODELS_CONFIG)
     parser.add_argument("--model-lists-dir", default=DEFAULT_MODEL_LISTS_DIR)
+    parser.add_argument("--model-decisions", default=DEFAULT_MODEL_DECISIONS)
+    parser.add_argument("--include-hidden-models", action="store_true")
     parser.add_argument("--jobs-dir", default=DEFAULT_JOBS_DIR)
     parser.add_argument("--config", default=os.getenv("CONFIG_PATH", "products.yaml"))
     parser.add_argument("--db", default=os.getenv("DB_PATH", "data/posted.sqlite3"))

@@ -1,0 +1,15 @@
+version: 1
+notes: Local persistent decisions for AI summary model comparison. Copy to data/model-decisions.yaml.
+models:
+  google:deep-research-preview-04-2026:
+    action: skip
+    reason: google_interactions_api_only
+    note: Requires Interactions API, not chat/completions.
+  openrouter:example-temporary-model:
+    action: retry_later
+    reason: rate_limit_observed
+    note: Hidden by default until limits recover.
+  google:gemini-2.5-flash-lite:
+    action: use
+    reason: good_primary_candidate
+    note: Kept visible.

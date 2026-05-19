@@ -35,6 +35,8 @@ import bot  # noqa: E402
 DEFAULT_MODELS_CONFIG = "scripts/model-summary-compare.local.yaml"
 DEFAULT_OUTPUT = "data/model-summary-comparison.md"
 DEFAULT_MODEL_LISTS_DIR = "data/model-lists"
+DEFAULT_MODEL_DECISIONS = "data/model-decisions.yaml"
+HIDDEN_MODEL_ACTIONS = {"skip", "retry_later"}
 
 
 @dataclass(frozen=True)
@@ -68,10 +70,13 @@ class ProviderConfig:
     max_attempts: int
     rate_limit_wait_seconds: float
     max_retry_after_seconds: float
+    rate_limit_total_wait_seconds: float
     extra_headers: dict[str, str]
     chat_completions_path: str
     models_path: str
     rate_limit_group: str
+    concurrent_requests: int
+    model_limits: dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,8 @@ class ModelConfig:
     api_key_query_param: str
     rpm: int
     rate_limit_group: str
+    concurrent_group: str
+    concurrent_requests: int
     timeout_seconds: int
     max_tokens: int
     max_output_chars: int
@@ -95,7 +102,11 @@ class ModelConfig:
     max_attempts: int
     rate_limit_wait_seconds: float
     max_retry_after_seconds: float
+    rate_limit_total_wait_seconds: float
     extra_headers: dict[str, str]
+    limit_category: str
+    tpm_limit: str
+    rpd_limit: str
     chat_completions_path: str = "/chat/completions"
 
     @property
@@ -116,6 +127,25 @@ class ModelListing:
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.model_id, "flags": list(self.flags), "label": self.label}
+
+
+@dataclass(frozen=True)
+class SummaryResult:
+    text: str
+    usage: dict[str, int]
+
+    def usage_text(self) -> str:
+        if not self.usage:
+            return ""
+        labels = [
+            ("total_tokens", "total"),
+            ("prompt_tokens", "prompt"),
+            ("completion_tokens", "completion"),
+            ("input_tokens", "input"),
+            ("output_tokens", "output"),
+        ]
+        parts = [f"{label}={self.usage[key]}" for key, label in labels if key in self.usage]
+        return "tokens: " + ", ".join(parts) if parts else ""
 
 
 class RpmLimiter:
@@ -172,6 +202,14 @@ def as_float(value: Any, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
+def as_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def as_str_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -199,6 +237,63 @@ def read_object(value: Any, context: str) -> dict[str, Any]:
     return value
 
 
+def normalize_decision_model_id(provider_name: str | None, model_id: str) -> str:
+    provider = (provider_name or "").strip()
+    model = str(model_id or "").strip()
+    if provider == "google" and model.startswith("models/"):
+        return model.split("/", 1)[1]
+    return model
+
+
+def model_decision_key(provider_name: str | None, model_id: str) -> str:
+    provider = (provider_name or "").strip() or "<none>"
+    return f"{provider}:{normalize_decision_model_id(provider, model_id)}"
+
+
+def load_model_decisions(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    data = read_yaml(path)
+    raw_models = data.get("models", {})
+    if raw_models is None:
+        return {}
+    if not isinstance(raw_models, dict):
+        raise ValueError("model decisions must contain a models object")
+
+    decisions: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_decision in raw_models.items():
+        if not isinstance(raw_decision, dict):
+            continue
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        decisions[key] = raw_decision
+    return decisions
+
+
+def get_model_decision(decisions: dict[str, dict[str, Any]], provider_name: str | None, model_id: str) -> dict[str, Any] | None:
+    key = model_decision_key(provider_name, model_id)
+    return decisions.get(key)
+
+
+def decision_action(decision: dict[str, Any] | None) -> str:
+    if not decision:
+        return ""
+    return str(decision.get("action") or "").strip().lower()
+
+
+def decision_hides_model(decision: dict[str, Any] | None) -> bool:
+    return decision_action(decision) in HIDDEN_MODEL_ACTIONS
+
+
+def decision_flags(decision: dict[str, Any] | None) -> tuple[str, ...]:
+    if not decision:
+        return ()
+    action = decision_action(decision).upper()
+    reason = str(decision.get("reason") or "").strip().upper().replace("-", "_")
+    return tuple(part for part in (action, reason) if part)
+
+
 def merge_headers(*values: Any) -> dict[str, str]:
     merged: dict[str, str] = {}
     for value in values:
@@ -209,6 +304,47 @@ def merge_headers(*values: Any) -> dict[str, str]:
         for key, header_value in value.items():
             merged[str(key)] = str(header_value)
     return merged
+
+
+def normalize_model_limits(provider_name: str, value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("model_limits must be an object keyed by model id")
+
+    result: dict[str, dict[str, Any]] = {}
+    for raw_model_id, raw_limit in value.items():
+        model_id = normalize_decision_model_id(provider_name, str(raw_model_id).strip())
+        if not model_id:
+            continue
+        if not isinstance(raw_limit, dict):
+            raise ValueError(f"model_limits.{raw_model_id} must be an object")
+        result[model_id] = raw_limit
+    return result
+
+
+def provider_model_limits(provider: ProviderConfig | None, model_id: str) -> dict[str, Any]:
+    if provider is None:
+        return {}
+    normalized_model_id = normalize_decision_model_id(provider.name, model_id)
+    return provider.model_limits.get(normalized_model_id) or provider.model_limits.get(model_id) or {}
+
+
+def optional_limit_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def model_limit_summary(model: ModelConfig) -> str:
+    parts = []
+    if model.limit_category:
+        parts.append(f"category={model.limit_category}")
+    if model.tpm_limit:
+        parts.append(f"tpm={model.tpm_limit}")
+    if model.rpd_limit:
+        parts.append(f"rpd={model.rpd_limit}")
+    return " | limits " + " ".join(parts) if parts else ""
 
 
 def parse_item_filter(raw_item: str) -> tuple[str, str]:
@@ -304,12 +440,21 @@ def load_provider_configs(
                 config_value(raw_provider.get("max_retry_after_seconds"), defaults.get("max_retry_after_seconds")),
                 300.0,
             ),
+            rate_limit_total_wait_seconds=as_float(
+                config_value(raw_provider.get("rate_limit_total_wait_seconds"), defaults.get("rate_limit_total_wait_seconds")),
+                300.0,
+            ),
             extra_headers=merge_headers(defaults.get("headers"), raw_provider.get("headers")),
             chat_completions_path=normalize_api_path(
                 config_value(raw_provider.get("chat_completions_path"), defaults.get("chat_completions_path"), "/chat/completions")
             ),
             models_path=normalize_api_path(config_value(raw_provider.get("models_path"), defaults.get("models_path"), "/models")),
             rate_limit_group=str(raw_provider.get("rate_limit_group") or name).strip() or name,
+            concurrent_requests=as_non_negative_int(
+                config_value(raw_provider.get("concurrent_requests"), defaults.get("concurrent_requests")),
+                0,
+            ),
+            model_limits=normalize_model_limits(name, raw_provider.get("model_limits")),
         )
     return providers
 
@@ -320,6 +465,8 @@ def load_model_configs(
     selected_models: set[str],
     require_keys: bool,
     require_models: bool = True,
+    decisions: dict[str, dict[str, Any]] | None = None,
+    include_hidden_models: bool = False,
 ) -> tuple[dict[str, ProviderConfig], list[ModelConfig], dict[str, Any], int]:
     data = read_yaml(config_path)
     env_file = str(data.get("env_file") or "").strip()
@@ -353,6 +500,15 @@ def load_model_configs(
         if selected_models and name not in selected_models and model not in selected_models:
             continue
 
+        decision = get_model_decision(decisions or {}, provider_name, model)
+        if decision_hides_model(decision) and not include_hidden_models:
+            print(
+                f"[decision] skipping {model_decision_key(provider_name, model)}: "
+                f"{decision_action(decision)} {decision.get('reason') or ''}",
+                flush=True,
+            )
+            continue
+
         api_base = str(config_value(raw_model.get("api_base"), provider.api_base if provider else None, defaults.get("api_base")) or "").strip().rstrip("/")
         if not api_base:
             raise ValueError(f"model {name!r} requires provider or api_base")
@@ -371,6 +527,14 @@ def load_model_configs(
             config_value(raw_model.get("max_tokens"), defaults.get("max_tokens")),
             max(max_output_chars * 6, 1000),
         )
+        model_limits = provider_model_limits(provider, model)
+        provider_group = str(provider.rate_limit_group if provider else provider_name or name).strip() or name
+        rate_limit_group = str(
+            raw_model.get("rate_limit_group")
+            or (f"{provider_group}:{normalize_decision_model_id(provider.name, model)}" if provider and model_limits.get("rpm") is not None else None)
+            or provider_group
+        ).strip() or name
+        concurrent_group = str(raw_model.get("concurrent_group") or provider_group).strip() or rate_limit_group
 
         models.append(
             ModelConfig(
@@ -391,13 +555,20 @@ def load_model_configs(
                         "key",
                     )
                 ),
-                rpm=as_int(config_value(raw_model.get("rpm"), provider.rpm if provider else None, defaults.get("rpm")), 10),
-                rate_limit_group=str(
-                    raw_model.get("rate_limit_group")
-                    or (provider.rate_limit_group if provider else None)
-                    or provider_name
-                    or name
-                ).strip() or name,
+                rpm=as_int(
+                    config_value(raw_model.get("rpm"), model_limits.get("rpm"), provider.rpm if provider else None, defaults.get("rpm")),
+                    10,
+                ),
+                rate_limit_group=rate_limit_group,
+                concurrent_group=concurrent_group,
+                concurrent_requests=as_non_negative_int(
+                    config_value(
+                        raw_model.get("concurrent_requests"),
+                        provider.concurrent_requests if provider else None,
+                        defaults.get("concurrent_requests"),
+                    ),
+                    0,
+                ),
                 timeout_seconds=as_int(
                     config_value(raw_model.get("timeout_seconds"), provider.timeout_seconds if provider else None, defaults.get("timeout_seconds")),
                     60,
@@ -427,7 +598,18 @@ def load_model_configs(
                     ),
                     300.0,
                 ),
+                rate_limit_total_wait_seconds=as_float(
+                    config_value(
+                        raw_model.get("rate_limit_total_wait_seconds"),
+                        provider.rate_limit_total_wait_seconds if provider else None,
+                        defaults.get("rate_limit_total_wait_seconds"),
+                    ),
+                    300.0,
+                ),
                 extra_headers=merge_headers(defaults.get("headers"), provider.extra_headers if provider else None, raw_model.get("headers")),
+                limit_category=optional_limit_text(model_limits.get("category")),
+                tpm_limit=optional_limit_text(model_limits.get("tpm")),
+                rpd_limit=optional_limit_text(model_limits.get("rpd")),
                 chat_completions_path=normalize_api_path(
                     config_value(
                         raw_model.get("chat_completions_path"),
@@ -547,13 +729,18 @@ async def resolve_release_cases(config_path: Path, release_rows: list[ReleaseRow
 
 def build_messages(model: ModelConfig, release: ReleaseCase) -> list[dict[str, str]]:
     summary_input = bot.build_summary_input(release.source, release.entry, model.max_input_chars)
+    product = str(release.source.get("product") or release.source["id"])
+    version = release.entry.version or release.entry.item_id
     return [
         {
             "role": "system",
             "content": (
                 "You summarize software release notes for model comparison. "
                 f"Return only the final answer: exactly one short sentence in {model.target_language}. "
-                "No reasoning. No markdown. No bullets. No quotes. Focus on practical changes."
+                "No reasoning. No markdown. No bullets. No quotes. Focus on practical changes. "
+                "Do not include the product name, release name, or version in the answer. "
+                "Start directly with the change, preferably with a passive verb such as "
+                "'Добавлен', 'Добавлена', 'Добавлены', 'Исправлен', 'Улучшен'."
             ),
         },
         {
@@ -561,7 +748,9 @@ def build_messages(model: ModelConfig, release: ReleaseCase) -> list[dict[str, s
             "content": (
                 f"Make a concise one-line summary of changes in {model.target_language}. "
                 f"Not longer than {model.max_output_chars} symbols. "
-                "Avoid phrases such as 'this release' and 'the update includes'.\n\n"
+                "Avoid phrases such as 'this release' and 'the update includes'. "
+                f"Do not mention or start with '{product}', '{version}', or '{product} {version}'; "
+                "start with the actual change instead.\n\n"
                 f"{summary_input}"
             ),
         },
@@ -585,7 +774,10 @@ def value_is_zero(value: Any) -> bool:
         return False
 
 
-def model_looks_free(item: Any, model_id: str) -> bool:
+def model_looks_free(item: Any, model_id: str, provider: ProviderConfig | None = None) -> bool:
+    if provider and provider.name == "ollama" and "ollama.com" in provider.api_base.lower():
+        return True
+
     lowered_id = model_id.lower()
     if lowered_id.endswith(":free") or lowered_id.endswith("-free") or ":free/" in lowered_id:
         return True
@@ -609,11 +801,55 @@ def model_looks_free(item: Any, model_id: str) -> bool:
     return False
 
 
+def optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_token_usage(data: Any) -> dict[str, int]:
+    if not isinstance(data, dict):
+        return {}
+
+    usage = data.get("usage")
+    native_usage = data.get("usageMetadata")
+    if not isinstance(usage, dict):
+        usage = native_usage if isinstance(native_usage, dict) else {}
+
+    result: dict[str, int] = {}
+    key_pairs = [
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("total_tokens", "total_tokens"),
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("promptTokenCount", "prompt_tokens"),
+        ("candidatesTokenCount", "completion_tokens"),
+        ("totalTokenCount", "total_tokens"),
+    ]
+    for source_key, target_key in key_pairs:
+        parsed = optional_int(usage.get(source_key))
+        if parsed is not None:
+            result[target_key] = parsed
+
+    if "total_tokens" not in result:
+        prompt_tokens = result.get("prompt_tokens", result.get("input_tokens"))
+        completion_tokens = result.get("completion_tokens", result.get("output_tokens"))
+        if prompt_tokens is not None and completion_tokens is not None:
+            result["total_tokens"] = prompt_tokens + completion_tokens
+    return result
+
+
 def model_looks_local(provider: ProviderConfig) -> bool:
     api_base = provider.api_base.lower()
     return provider.auth_type == "none" and (
         "localhost" in api_base or "127.0.0.1" in api_base or "host.docker.internal" in api_base
     )
+
+
+def model_looks_cloud(provider: ProviderConfig) -> bool:
+    return "ollama.com" in provider.api_base.lower()
 
 
 def extract_model_listings(data: Any, provider: ProviderConfig) -> list[ModelListing]:
@@ -636,8 +872,10 @@ def extract_model_listings(data: Any, provider: ProviderConfig) -> list[ModelLis
         model_text = str(model_id or "").strip()
         if model_text:
             flags: list[str] = []
-            if model_looks_free(item, model_text):
+            if model_looks_free(item, model_text, provider):
                 flags.append("FREE")
+            if model_looks_cloud(provider):
+                flags.append("CLOUD")
             if model_looks_local(provider):
                 flags.append("LOCAL")
             listings.append(ModelListing(model_id=model_text, flags=tuple(flags), label=str(label).strip() if label else None))
@@ -648,6 +886,23 @@ def extract_model_listings(data: Any, provider: ProviderConfig) -> list[ModelLis
     return sorted(unique.values(), key=lambda listing: listing.model_id)
 
 
+def apply_model_decisions_to_listings(
+    provider: ProviderConfig,
+    listings: list[ModelListing],
+    decisions: dict[str, dict[str, Any]],
+    *,
+    include_hidden_models: bool,
+) -> list[ModelListing]:
+    filtered: list[ModelListing] = []
+    for listing in listings:
+        decision = get_model_decision(decisions, provider.name, listing.model_id)
+        if decision_hides_model(decision) and not include_hidden_models:
+            continue
+        flags = tuple(dict.fromkeys([*listing.flags, *decision_flags(decision)]))
+        filtered.append(ModelListing(model_id=listing.model_id, flags=flags, label=listing.label))
+    return filtered
+
+
 async def fetch_provider_model_ids(client: httpx.AsyncClient, provider: ProviderConfig) -> list[ModelListing]:
     api_url = f"{provider.api_base}{provider.models_path}"
     if auth_requires_key(provider.auth_type) and not provider.api_key:
@@ -656,19 +911,25 @@ async def fetch_provider_model_ids(client: httpx.AsyncClient, provider: Provider
     headers.setdefault("Accept", "application/json")
     limiter = RpmLimiter(provider.rpm)
 
+    rate_limit_waited = 0.0
     for attempt in range(1, provider.max_attempts + 1):
         await limiter.wait()
         response = await client.get(api_url, headers=headers, params=params, timeout=provider.timeout_seconds)
         if response.status_code == 429:
             delay = parse_retry_after(response, provider.rate_limit_wait_seconds)
-            if delay > provider.max_retry_after_seconds:
-                raise RuntimeError(f"rate limited; retry_after={delay:.1f}s; {compact_error(response.text)}")
+            if delay > provider.max_retry_after_seconds or rate_limit_waited + delay > provider.rate_limit_total_wait_seconds:
+                raise RuntimeError(
+                    f"rate limited; retry_after={delay:.1f}s; "
+                    f"waited={rate_limit_waited:.1f}s; budget={provider.rate_limit_total_wait_seconds:.1f}s; "
+                    f"{compact_error(response.text)}"
+                )
             print(
                 f"[{provider.name}] 429 while listing models, sleeping {delay:.1f}s "
                 f"(attempt {attempt}/{provider.max_attempts})",
                 flush=True,
             )
             await asyncio.sleep(delay)
+            rate_limit_waited += delay
             continue
         if response.status_code >= 400:
             raise RuntimeError(f"HTTP {response.status_code}: {compact_error(response.text)}")
@@ -678,7 +939,13 @@ async def fetch_provider_model_ids(client: httpx.AsyncClient, provider: Provider
     raise RuntimeError(f"rate limit after {provider.max_attempts} attempts")
 
 
-async def list_provider_models(providers: dict[str, ProviderConfig], selected_providers: set[str]) -> None:
+async def list_provider_models(
+    providers: dict[str, ProviderConfig],
+    selected_providers: set[str],
+    decisions: dict[str, dict[str, Any]],
+    *,
+    include_hidden_models: bool,
+) -> None:
     if not providers:
         raise ValueError("config has no providers")
 
@@ -697,6 +964,13 @@ async def list_provider_models(providers: dict[str, ProviderConfig], selected_pr
                 print(f"ERROR {type(exc).__name__}: {exc}")
                 continue
 
+            model_listings = apply_model_decisions_to_listings(
+                provider,
+                model_listings,
+                decisions,
+                include_hidden_models=include_hidden_models,
+            )
+
             if not model_listings:
                 print("<no models returned>")
                 continue
@@ -708,6 +982,9 @@ async def refresh_provider_model_lists(
     providers: dict[str, ProviderConfig],
     selected_providers: set[str],
     output_dir: Path,
+    decisions: dict[str, dict[str, Any]],
+    *,
+    include_hidden_models: bool,
 ) -> None:
     if not providers:
         raise ValueError("config has no providers")
@@ -725,7 +1002,13 @@ async def refresh_provider_model_lists(
             json_path = output_dir / f"{provider.name}.json"
             print(f"[models] refreshing {provider.name} -> {txt_path}", flush=True)
             try:
-                model_listings = await fetch_provider_model_ids(client, provider)
+                fetched_model_listings = await fetch_provider_model_ids(client, provider)
+                model_listings = apply_model_decisions_to_listings(
+                    provider,
+                    fetched_model_listings,
+                    decisions,
+                    include_hidden_models=include_hidden_models,
+                )
                 txt_lines = [f"# {provider.name} ({provider.api_base})"]
                 txt_lines.extend(listing.format_line() for listing in model_listings)
                 txt_path.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
@@ -742,7 +1025,9 @@ async def refresh_provider_model_lists(
                     + "\n",
                     encoding="utf-8",
                 )
-                print(f"[models] wrote {len(model_listings)} model(s) for {provider.name}", flush=True)
+                hidden_count = len(fetched_model_listings) - len(model_listings)
+                hidden_text = f", hidden {hidden_count}" if hidden_count else ""
+                print(f"[models] wrote {len(model_listings)} model(s) for {provider.name}{hidden_text}", flush=True)
             except Exception as exc:
                 error_text = f"ERROR {type(exc).__name__}: {exc}"
                 txt_path.write_text(
@@ -799,15 +1084,60 @@ def compact_error(text: str, limit: int = 220) -> str:
     return bot.truncate(re.sub(r"\s+", " ", text).strip(), limit)
 
 
+def strip_closed_reasoning_blocks(text: str) -> str:
+    cleaned = re.sub(r"(?is)<(?:think|thought)>.*?</(?:think|thought)>", " ", text).strip()
+    return cleaned or text.strip()
+
+
+def is_reasoning_only(text: str) -> bool:
+    return text.lstrip().lower().startswith(("<think>", "<thought>"))
+
+
+def strip_release_lead_in(summary: str, release: ReleaseCase) -> str:
+    product = str(release.source.get("product") or release.source["id"])
+    version = str(release.entry.version or release.entry.item_id or "")
+    version_body = version[1:] if version.lower().startswith("v") else version
+    product_pattern = re.escape(product)
+    version_pattern = rf"v?{re.escape(version_body)}" if version_body else ""
+
+    patterns = []
+    if version_pattern:
+        patterns.extend(
+            [
+                rf"(?i)^(?:{product_pattern}\s+)?{version_pattern}\s*(?:[:—–-]\s*|\s+)",
+                rf"(?i)^в\s+{version_pattern}\s+",
+            ]
+        )
+    patterns.append(rf"(?i)^{product_pattern}\s*(?:[:—–-]\s*|\s+)")
+
+    cleaned = summary.strip()
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, count=1).strip()
+
+    verb_rewrites = {
+        "добавляет": "Добавлен",
+        "включает": "Добавлен",
+        "улучшает": "Улучшен",
+        "исправляет": "Исправлен",
+        "обновляет": "Обновлен",
+    }
+    lowered = cleaned.lower()
+    for active_verb, passive_verb in verb_rewrites.items():
+        if lowered.startswith(active_verb + " "):
+            return passive_verb + cleaned[len(active_verb):]
+
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else cleaned
+
+
 async def generate_summary(
     client: httpx.AsyncClient,
     model: ModelConfig,
     release: ReleaseCase,
     limiter: RpmLimiter,
-) -> str:
+) -> SummaryResult:
     api_url = f"{model.api_base}{model.chat_completions_path}"
     if auth_requires_key(model.auth_type) and not model.api_key:
-        return "ERROR missing API key"
+        return SummaryResult("ERROR missing API key", {})
     headers, params = build_auth_request_parts(model, content_type="application/json")
     payload = {
         "model": model.model,
@@ -817,13 +1147,14 @@ async def generate_summary(
         "messages": build_messages(model, release),
     }
 
+    rate_limit_waited = 0.0
     for attempt in range(1, model.max_attempts + 1):
         await limiter.wait()
         try:
             response = await client.post(api_url, headers=headers, params=params, json=payload, timeout=model.timeout_seconds)
         except Exception as exc:
             if attempt >= model.max_attempts:
-                return f"ERROR request: {type(exc).__name__}: {exc}"
+                return SummaryResult(f"ERROR request: {type(exc).__name__}: {exc}", {})
             delay = min(model.rate_limit_wait_seconds, 2 ** attempt)
             print(f"[{model.column_title}] request failed, sleeping {delay:.1f}s: {exc}", flush=True)
             await asyncio.sleep(delay)
@@ -831,40 +1162,103 @@ async def generate_summary(
 
         if response.status_code == 429:
             delay = parse_retry_after(response, model.rate_limit_wait_seconds)
-            if delay > model.max_retry_after_seconds:
-                return f"RATE_LIMIT retry_after={delay:.1f}s: {compact_error(response.text)}"
+            if delay > model.max_retry_after_seconds or rate_limit_waited + delay > model.rate_limit_total_wait_seconds:
+                return SummaryResult(
+                    f"RATE_LIMIT retry_after={delay:.1f}s waited={rate_limit_waited:.1f}s "
+                    f"budget={model.rate_limit_total_wait_seconds:.1f}s: {compact_error(response.text)}",
+                    {},
+                )
             print(
                 f"[{model.column_title}] 429 rate limit on {release.key[0]}:{release.key[1]}, "
                 f"sleeping {delay:.1f}s (attempt {attempt}/{model.max_attempts})",
                 flush=True,
             )
             await asyncio.sleep(delay)
+            rate_limit_waited += delay
             continue
 
         if response.status_code >= 400:
-            return f"ERROR HTTP {response.status_code}: {compact_error(response.text)}"
+            return SummaryResult(f"ERROR HTTP {response.status_code}: {compact_error(response.text)}", {})
 
         try:
             data = response.json()
         except ValueError:
-            return f"ERROR invalid JSON: {compact_error(response.text)}"
+            return SummaryResult(f"ERROR invalid JSON: {compact_error(response.text)}", {})
 
+        usage = extract_token_usage(data)
         content, finish_reason, message_keys = extract_content(data)
         if content is None:
-            return f"EMPTY content; finish_reason={finish_reason!r}; message_keys={message_keys}"
+            return SummaryResult(f"EMPTY content; finish_reason={finish_reason!r}; message_keys={message_keys}", usage)
+
+        content = strip_closed_reasoning_blocks(content)
+        if is_reasoning_only(content):
+            return SummaryResult(f"EMPTY reasoning-only content; raw={compact_error(content)!r}", usage)
 
         summary = bot.clean_one_line_summary(content, max_len=model.max_output_chars)
+        summary = strip_release_lead_in(summary, release)
         if not summary:
-            return f"EMPTY cleaned content; finish_reason={finish_reason!r}; raw={compact_error(content)!r}"
-        return summary
+            return SummaryResult(f"EMPTY cleaned content; finish_reason={finish_reason!r}; raw={compact_error(content)!r}", usage)
+        return SummaryResult(summary, usage)
 
-    return f"ERROR rate limit after {model.max_attempts} attempts"
+    return SummaryResult(f"ERROR rate limit after {model.max_attempts} attempts", {})
 
 
 def markdown_cell(text: str) -> str:
     text = re.sub(r"\s+", " ", str(text)).strip()
     text = text.replace("|", "\\|")
     return text or "-"
+
+
+def result_status_label(result: SummaryResult | None) -> str:
+    if result is None:
+        return "🔴 Error/Danger"
+
+    text = result.text.strip()
+    upper_text = text.upper()
+    rate_limit_markers = (
+        "RATE_LIMIT",
+        "RATE LIMIT",
+        "ERROR RATE LIMIT",
+        "ERROR HTTP 429",
+        "QUOTA",
+        "TOO MANY CONCURRENT REQUESTS",
+    )
+    warning_markers = (
+        "EMPTY ",
+        "ERROR HTTP 402",
+        "ERROR HTTP 503",
+        "INSUFFICIENT CREDITS",
+        "SPEND LIMIT",
+        "BILLING",
+        "SUBSCRIPTION",
+        "UPGRADE",
+        "HIGH DEMAND",
+        "UNAVAILABLE",
+    )
+    if upper_text.startswith(rate_limit_markers) or any(marker in upper_text for marker in rate_limit_markers[3:]):
+        return "⚠️ Rate Limit"
+    if upper_text.startswith(warning_markers) or any(marker in upper_text for marker in warning_markers[3:]):
+        return "🟡 Warning/Caution"
+    if upper_text.startswith("ERROR"):
+        return "🔴 Error/Danger"
+    return "🔵 Active/Success"
+
+
+def result_cell(result: SummaryResult | None) -> str:
+    if result is None:
+        return f"{result_status_label(result)}<br>-"
+
+    status = result_status_label(result)
+    usage_text = result.usage_text()
+    if usage_text:
+        return f"{status}<br>{markdown_cell(result.text)}<br><small>{markdown_cell(usage_text)}</small>"
+    return f"{status}<br>{markdown_cell(result.text)}"
+
+
+def release_label(release: ReleaseCase) -> str:
+    product = str(release.source.get("product") or release.source["id"])
+    version = release.entry.version or release.entry.item_id
+    return f"{product} {version}"
 
 
 def release_description(release: ReleaseCase, *, max_chars: int) -> str:
@@ -887,7 +1281,7 @@ def release_description(release: ReleaseCase, *, max_chars: int) -> str:
 def build_markdown_table(
     releases: list[ReleaseCase],
     models: list[ModelConfig],
-    results: dict[tuple[tuple[str, str], str], str],
+    results: dict[tuple[tuple[str, str], str], SummaryResult],
     *,
     row_description_chars: int,
     db_path: Path,
@@ -899,14 +1293,34 @@ def build_markdown_table(
         f"Generated at: `{generated_at}`",
         f"DB: `{db_path}`",
         "",
-        "| Описание релиза | " + " | ".join(markdown_cell(model.column_title) for model in models) + " |",
-        "|---|" + "---|" * len(models),
+        "## Описания релизов",
+        "",
+        "| Релиз | Описание |",
+        "|---|---|",
     ]
 
     for release in releases:
-        cells = [release_description(release, max_chars=row_description_chars)]
-        for model in models:
-            cells.append(markdown_cell(results.get((release.key, model.column_title), "")))
+        lines.append(
+            "| "
+            + markdown_cell(release_label(release))
+            + " | "
+            + release_description(release, max_chars=row_description_chars)
+            + " |"
+        )
+
+    lines.extend(["", "## Ответы моделей", ""])
+    release_headers = ["Ответ"] if len(releases) == 1 else [release_label(release) for release in releases]
+    lines.extend(
+        [
+            "| Модель | " + " | ".join(markdown_cell(header) for header in release_headers) + " |",
+            "|---|" + "---|" * len(releases),
+        ]
+    )
+
+    for model in models:
+        cells = [markdown_cell(model.column_title)]
+        for release in releases:
+            cells.append(result_cell(results.get((release.key, model.column_title))))
         lines.append("| " + " | ".join(cells) + " |")
 
     lines.append("")
@@ -918,18 +1332,33 @@ async def run_comparison(
     models: list[ModelConfig],
     *,
     concurrent_models: int,
-) -> dict[tuple[tuple[str, str], str], str]:
-    results: dict[tuple[tuple[str, str], str], str] = {}
+) -> dict[tuple[tuple[str, str], str], SummaryResult]:
+    results: dict[tuple[tuple[str, str], str], SummaryResult] = {}
     limiters: dict[str, RpmLimiter] = {}
+    group_concurrent_requests: dict[str, int] = {}
     for model in models:
         existing = limiters.get(model.rate_limit_group)
         if existing is None or model.rpm < existing.rpm:
             limiters[model.rate_limit_group] = RpmLimiter(model.rpm)
+        if model.concurrent_requests > 0:
+            existing_concurrency = group_concurrent_requests.get(model.concurrent_group)
+            if existing_concurrency is None or model.concurrent_requests < existing_concurrency:
+                group_concurrent_requests[model.concurrent_group] = model.concurrent_requests
 
     semaphore = asyncio.Semaphore(max(1, concurrent_models))
+    group_semaphores = {
+        group: asyncio.Semaphore(max(1, value))
+        for group, value in group_concurrent_requests.items()
+    }
 
-    async def run_one(client: httpx.AsyncClient, release: ReleaseCase, model: ModelConfig) -> tuple[tuple[str, str], str, str]:
+    async def run_one(client: httpx.AsyncClient, release: ReleaseCase, model: ModelConfig) -> tuple[tuple[str, str], str, SummaryResult]:
         async with semaphore:
+            group_semaphore = group_semaphores.get(model.concurrent_group)
+            if group_semaphore:
+                async with group_semaphore:
+                    print(f"  [model] {model.column_title}", flush=True)
+                    summary = await generate_summary(client, model, release, limiters[model.rate_limit_group])
+                    return release.key, model.column_title, summary
             print(f"  [model] {model.column_title}", flush=True)
             summary = await generate_summary(client, model, release, limiters[model.rate_limit_group])
             return release.key, model.column_title, summary
@@ -941,7 +1370,8 @@ async def run_comparison(
             for task in asyncio.as_completed(tasks):
                 release_key, model_title, summary = await task
                 results[(release_key, model_title)] = summary
-                print(f"  [done] {model_title}: {bot.truncate(summary, 140)}", flush=True)
+                usage_text = f" ({summary.usage_text()})" if summary.usage_text() else ""
+                print(f"  [done] {model_title}: {bot.truncate(summary.text, 140)}{usage_text}", flush=True)
     return results
 
 
@@ -958,6 +1388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", default=os.getenv("DB_PATH", "data/posted.sqlite3"), help="SQLite state DB path")
     parser.add_argument("--output", help=f"Markdown output path, default from config or {DEFAULT_OUTPUT}")
     parser.add_argument("--model-lists-dir", default=DEFAULT_MODEL_LISTS_DIR, help="Directory for cached provider model lists")
+    parser.add_argument("--model-decisions", default=DEFAULT_MODEL_DECISIONS, help="YAML file with persistent model skip/retry decisions")
     parser.add_argument("--limit", type=int, help="Number of recent releases to compare")
     parser.add_argument("--source-id", action="append", default=[], help="Limit releases to source id; repeatable")
     parser.add_argument("--item", action="append", default=[], help="Explicit release as source_id:item_id; repeatable")
@@ -967,6 +1398,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chat-id", help="Select recent sent releases for one chat from deliveries")
     parser.add_argument("--list-provider-models", action="store_true", help="List model ids returned by configured providers")
     parser.add_argument("--refresh-model-lists", action="store_true", help="Fetch provider model lists and write them to files")
+    parser.add_argument("--include-hidden-models", action="store_true", help="Include models hidden by model decisions")
     parser.add_argument("--list-items", action="store_true", help="Only list selected DB releases; no model calls")
     parser.add_argument("--dry-run", action="store_true", help="Show selected releases/models without calling model APIs")
     return parser.parse_args()
@@ -990,20 +1422,34 @@ async def async_main() -> int:
     providers: dict[str, ProviderConfig] = {}
     models: list[ModelConfig] = []
     config_concurrent_models = 1
+    decisions = load_model_decisions(resolve_path(args.model_decisions))
     if models_config_path.exists():
         providers, models, model_data, config_concurrent_models = load_model_configs(
             models_config_path,
             selected_models=set(args.model),
             require_keys=not args.dry_run and not args.list_items,
             require_models=not args.list_provider_models and not args.refresh_model_lists,
+            decisions=decisions,
+            include_hidden_models=args.include_hidden_models,
         )
 
     if args.list_provider_models:
-        await list_provider_models(providers, set(args.provider))
+        await list_provider_models(
+            providers,
+            set(args.provider),
+            decisions,
+            include_hidden_models=args.include_hidden_models,
+        )
         return 0
 
     if args.refresh_model_lists:
-        await refresh_provider_model_lists(providers, set(args.provider), resolve_path(args.model_lists_dir))
+        await refresh_provider_model_lists(
+            providers,
+            set(args.provider),
+            resolve_path(args.model_lists_dir),
+            decisions,
+            include_hidden_models=args.include_hidden_models,
+        )
         return 0
 
     items_config = model_data.get("items", {}) if isinstance(model_data.get("items", {}), dict) else {}
@@ -1043,7 +1489,10 @@ async def async_main() -> int:
             provider_label = model.provider_name or "<model override>"
             print(
                 f"{model.column_title} | {model.model} | provider={provider_label} | "
-                f"rpm={model.rpm} | api_base={model.api_base}"
+                f"rpm={model.rpm} | max_tokens={model.max_tokens} | "
+                f"rate_limit_wait_budget={model.rate_limit_total_wait_seconds:.1f}s | "
+                f"rate_group={model.rate_limit_group} | concurrent_group={model.concurrent_group} | "
+                f"concurrent_requests={model.concurrent_requests or '-'}{model_limit_summary(model)} | api_base={model.api_base}"
             )
         return 0
 

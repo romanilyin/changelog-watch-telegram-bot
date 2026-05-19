@@ -21,7 +21,7 @@ import re
 import secrets
 import signal
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -469,6 +469,71 @@ class ChangelogEntry:
     body: str
     url: str
     is_prerelease: bool = False
+
+
+@dataclass(frozen=True)
+class AiSummaryProviderConfig:
+    name: str
+    api_base: str
+    api_key: str
+    auth_type: str
+    api_key_header: str
+    api_key_query_param: str
+    rpm: int
+    timeout_seconds: int
+    max_attempts: int
+    rate_limit_wait_seconds: float
+    max_retry_after_seconds: float
+    rate_limit_total_wait_seconds: float
+    extra_headers: dict[str, str]
+    chat_completions_path: str
+    rate_limit_group: str
+    model_limits: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class AiSummaryModelConfig:
+    name: str
+    model: str
+    provider_name: str | None
+    api_base: str
+    api_key: str
+    auth_type: str
+    api_key_header: str
+    api_key_query_param: str
+    rpm: int
+    rate_limit_group: str
+    timeout_seconds: int
+    max_tokens: int
+    max_input_chars: int
+    max_output_chars: int
+    target_language: str
+    temperature: float
+    max_attempts: int
+    rate_limit_wait_seconds: float
+    max_retry_after_seconds: float
+    rate_limit_total_wait_seconds: float
+    extra_headers: dict[str, str]
+    chat_completions_path: str
+    limit_category: str
+    tpm_limit: str
+    rpd_limit: str
+
+    @property
+    def cache_key(self) -> str:
+        if self.provider_name == "legacy":
+            return self.model
+        provider = self.provider_name or "custom"
+        return f"{provider}:{self.model}"
+
+    @property
+    def label(self) -> str:
+        return self.name or self.cache_key
+
+
+@dataclass(frozen=True)
+class AiSummarySettings:
+    models: list[AiSummaryModelConfig]
 
 
 @dataclass(frozen=True)
@@ -2539,6 +2604,32 @@ def ai_summary_enabled() -> bool:
     return os.getenv("AI_SUMMARY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+class AiSummaryRpmLimiter:
+    def __init__(self, rpm: int):
+        self.rpm = max(1, rpm)
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = monotonic()
+            while self._calls and now - self._calls[0] >= 60.0:
+                self._calls.popleft()
+
+            if len(self._calls) >= self.rpm:
+                delay = max(0.0, 60.0 - (now - self._calls[0]))
+                LOG.info("AI summary RPM limit %d/min reached; sleeping %.1fs", self.rpm, delay)
+                await asyncio.sleep(delay)
+                now = monotonic()
+                while self._calls and now - self._calls[0] >= 60.0:
+                    self._calls.popleft()
+
+            self._calls.append(monotonic())
+
+
+_AI_SUMMARY_RATE_LIMITERS: dict[str, AiSummaryRpmLimiter] = {}
+
+
 def _parse_ai_summary_int(value: str | None, default: int) -> int:
     try:
         parsed = int((value or "").strip())
@@ -2547,28 +2638,384 @@ def _parse_ai_summary_int(value: str | None, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def get_ai_summary_settings() -> tuple[str, str, str, int, int, int]:
-    api_base = os.getenv("AI_SUMMARY_API_BASE", "https://opencode.ai/zen/v1").strip().rstrip("/")
-    if not api_base:
-        api_base = "https://opencode.ai/zen/v1"
+def _parse_ai_summary_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
+
+def _parse_ai_summary_config_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _config_value(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _read_ai_summary_object(value: Any, context: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be an object")
+    return value
+
+
+def _merge_ai_summary_headers(*values: Any) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError("headers must be an object")
+        for key, header_value in value.items():
+            headers[str(key)] = str(header_value)
+    return headers
+
+
+def _normalize_ai_summary_auth_type(value: Any) -> str:
+    auth_type = str(value or "bearer").strip().lower().replace("_", "-")
+    if auth_type in {"bearer", "api-key", "query-key", "none"}:
+        return auth_type
+    raise ValueError(f"auth_type must be one of bearer|api-key|query-key|none, got {auth_type!r}")
+
+
+def _ai_summary_auth_requires_key(auth_type: str) -> bool:
+    return _normalize_ai_summary_auth_type(auth_type) != "none"
+
+
+def _normalize_ai_summary_api_path(value: Any) -> str:
+    path = str(value or "/chat/completions").strip() or "/chat/completions"
+    return path if path.startswith("/") else f"/{path}"
+
+
+def _resolve_ai_summary_config_path(raw_path: str, *, base_dir: Path = PROJECT_ROOT) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def _pick_ai_summary_api_key(raw_config: dict[str, Any]) -> str:
+    api_key = str(raw_config.get("api_key") or "").strip()
+    api_key_env = str(raw_config.get("api_key_env") or "").strip()
+    if not api_key and api_key_env:
+        api_key = os.getenv(api_key_env, "").strip()
+    return api_key
+
+
+def _normalize_ai_summary_model_id(provider_name: str | None, model_id: str) -> str:
+    provider = (provider_name or "").strip()
+    model = str(model_id or "").strip()
+    if provider == "google" and model.startswith("models/"):
+        return model.split("/", 1)[1]
+    return model
+
+
+def _normalize_ai_summary_model_limits(provider_name: str, value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("model_limits must be an object keyed by model id")
+
+    result: dict[str, dict[str, Any]] = {}
+    for raw_model_id, raw_limit in value.items():
+        model_id = _normalize_ai_summary_model_id(provider_name, str(raw_model_id).strip())
+        if not model_id:
+            continue
+        if not isinstance(raw_limit, dict):
+            raise ValueError(f"model_limits.{raw_model_id} must be an object")
+        result[model_id] = raw_limit
+    return result
+
+
+def _ai_summary_provider_model_limits(provider: AiSummaryProviderConfig | None, model_id: str) -> dict[str, Any]:
+    if provider is None:
+        return {}
+    normalized_model_id = _normalize_ai_summary_model_id(provider.name, model_id)
+    return provider.model_limits.get(normalized_model_id) or provider.model_limits.get(model_id) or {}
+
+
+def _optional_ai_summary_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _load_ai_summary_provider_configs(data: dict[str, Any], defaults: dict[str, Any]) -> dict[str, AiSummaryProviderConfig]:
+    raw_providers = data.get("providers", {})
+    if raw_providers is None:
+        raw_providers = {}
+    if not isinstance(raw_providers, dict):
+        raise ValueError("providers must be an object keyed by provider name")
+
+    providers: dict[str, AiSummaryProviderConfig] = {}
+    for provider_name, raw_provider_value in raw_providers.items():
+        name = str(provider_name).strip()
+        if not name:
+            raise ValueError("provider name must be non-empty")
+        raw_provider = _read_ai_summary_object(raw_provider_value, f"providers.{name}")
+        api_base = str(_config_value(raw_provider.get("api_base"), defaults.get("api_base")) or "").strip().rstrip("/")
+        if not api_base:
+            raise ValueError(f"provider {name!r} requires api_base")
+
+        providers[name] = AiSummaryProviderConfig(
+            name=name,
+            api_base=api_base,
+            api_key=_pick_ai_summary_api_key(raw_provider),
+            auth_type=_normalize_ai_summary_auth_type(_config_value(raw_provider.get("auth_type"), defaults.get("auth_type"), "bearer")),
+            api_key_header=str(_config_value(raw_provider.get("api_key_header"), defaults.get("api_key_header"), "x-api-key")),
+            api_key_query_param=str(_config_value(raw_provider.get("api_key_query_param"), defaults.get("api_key_query_param"), "key")),
+            rpm=_parse_ai_summary_config_int(_config_value(raw_provider.get("rpm"), defaults.get("rpm")), 10),
+            timeout_seconds=_parse_ai_summary_config_int(_config_value(raw_provider.get("timeout_seconds"), defaults.get("timeout_seconds")), 60),
+            max_attempts=_parse_ai_summary_config_int(_config_value(raw_provider.get("max_attempts"), defaults.get("max_attempts")), 3),
+            rate_limit_wait_seconds=_parse_ai_summary_float(
+                _config_value(raw_provider.get("rate_limit_wait_seconds"), defaults.get("rate_limit_wait_seconds")),
+                30.0,
+            ),
+            max_retry_after_seconds=_parse_ai_summary_float(
+                _config_value(raw_provider.get("max_retry_after_seconds"), defaults.get("max_retry_after_seconds")),
+                120.0,
+            ),
+            rate_limit_total_wait_seconds=_parse_ai_summary_float(
+                _config_value(raw_provider.get("rate_limit_total_wait_seconds"), defaults.get("rate_limit_total_wait_seconds")),
+                120.0,
+            ),
+            extra_headers=_merge_ai_summary_headers(defaults.get("headers"), raw_provider.get("headers")),
+            chat_completions_path=_normalize_ai_summary_api_path(
+                _config_value(raw_provider.get("chat_completions_path"), defaults.get("chat_completions_path"), "/chat/completions")
+            ),
+            rate_limit_group=str(raw_provider.get("rate_limit_group") or name).strip() or name,
+            model_limits=_normalize_ai_summary_model_limits(name, raw_provider.get("model_limits")),
+        )
+    return providers
+
+
+def load_ai_summary_settings_from_yaml(path: Path) -> AiSummarySettings:
+    data = load_yaml_file(path)
+    env_file = normalize_string(data.get("env_file"))
+    if env_file:
+        load_dotenv(_resolve_ai_summary_config_path(env_file, base_dir=path.parent), override=False)
+
+    defaults = _read_ai_summary_object(data.get("defaults", {}), "defaults")
+    providers = _load_ai_summary_provider_configs(data, defaults)
+    raw_models = data.get("models", [])
+    if not isinstance(raw_models, list) or not raw_models:
+        raise ValueError("AI summary models config must contain a non-empty models list")
+
+    models: list[AiSummaryModelConfig] = []
+    for index, raw_model in enumerate(raw_models, start=1):
+        if not isinstance(raw_model, dict):
+            raise ValueError(f"models[{index}] must be an object")
+
+        model = str(raw_model.get("model") or "").strip()
+        if not model:
+            raise ValueError(f"models[{index}].model is required")
+        name = str(raw_model.get("name") or model).strip()
+        provider_name = str(raw_model.get("provider") or "").strip() or None
+        provider = providers.get(provider_name) if provider_name else None
+        if provider_name and provider is None:
+            raise ValueError(f"AI summary model {name!r} references unknown provider {provider_name!r}")
+
+        api_base = str(_config_value(raw_model.get("api_base"), provider.api_base if provider else None, defaults.get("api_base")) or "").strip().rstrip("/")
+        if not api_base:
+            raise ValueError(f"AI summary model {name!r} requires provider or api_base")
+
+        auth_type = _normalize_ai_summary_auth_type(
+            _config_value(raw_model.get("auth_type"), provider.auth_type if provider else None, defaults.get("auth_type"), "bearer")
+        )
+        model_api_key = _pick_ai_summary_api_key(raw_model)
+        api_key = model_api_key or (provider.api_key if provider else "")
+
+        max_output_chars = _parse_ai_summary_config_int(
+            _config_value(raw_model.get("max_output_chars"), defaults.get("max_output_chars"), os.getenv("AI_SUMMARY_MAX_OUTPUT_CHARS")),
+            440,
+        )
+        max_tokens = _parse_ai_summary_config_int(
+            _config_value(raw_model.get("max_tokens"), defaults.get("max_tokens"), os.getenv("AI_SUMMARY_MAX_TOKENS")),
+            10000,
+        )
+        model_limits = _ai_summary_provider_model_limits(provider, model)
+        provider_group = str(provider.rate_limit_group if provider else provider_name or name).strip() or name
+        rate_limit_group = str(
+            raw_model.get("rate_limit_group")
+            or (f"{provider_group}:{_normalize_ai_summary_model_id(provider.name, model)}" if provider and model_limits.get("rpm") is not None else None)
+            or provider_group
+        ).strip() or name
+
+        models.append(
+            AiSummaryModelConfig(
+                name=name,
+                model=model,
+                provider_name=provider.name if provider else provider_name,
+                api_base=api_base,
+                api_key=api_key,
+                auth_type=auth_type,
+                api_key_header=str(
+                    _config_value(raw_model.get("api_key_header"), provider.api_key_header if provider else None, defaults.get("api_key_header"), "x-api-key")
+                ),
+                api_key_query_param=str(
+                    _config_value(raw_model.get("api_key_query_param"), provider.api_key_query_param if provider else None, defaults.get("api_key_query_param"), "key")
+                ),
+                rpm=_parse_ai_summary_config_int(
+                    _config_value(raw_model.get("rpm"), model_limits.get("rpm"), provider.rpm if provider else None, defaults.get("rpm")),
+                    10,
+                ),
+                rate_limit_group=rate_limit_group,
+                timeout_seconds=_parse_ai_summary_config_int(
+                    _config_value(raw_model.get("timeout_seconds"), provider.timeout_seconds if provider else None, defaults.get("timeout_seconds")),
+                    60,
+                ),
+                max_tokens=max_tokens,
+                max_input_chars=_parse_ai_summary_config_int(_config_value(raw_model.get("max_input_chars"), defaults.get("max_input_chars")), 6000),
+                max_output_chars=max_output_chars,
+                target_language=str(_config_value(raw_model.get("target_language"), defaults.get("target_language"), "ru")).strip() or "ru",
+                temperature=_parse_ai_summary_float(_config_value(raw_model.get("temperature"), defaults.get("temperature")), 0.2),
+                max_attempts=_parse_ai_summary_config_int(
+                    _config_value(raw_model.get("max_attempts"), provider.max_attempts if provider else None, defaults.get("max_attempts")),
+                    3,
+                ),
+                rate_limit_wait_seconds=_parse_ai_summary_float(
+                    _config_value(raw_model.get("rate_limit_wait_seconds"), provider.rate_limit_wait_seconds if provider else None, defaults.get("rate_limit_wait_seconds")),
+                    30.0,
+                ),
+                max_retry_after_seconds=_parse_ai_summary_float(
+                    _config_value(raw_model.get("max_retry_after_seconds"), provider.max_retry_after_seconds if provider else None, defaults.get("max_retry_after_seconds")),
+                    120.0,
+                ),
+                rate_limit_total_wait_seconds=_parse_ai_summary_float(
+                    _config_value(raw_model.get("rate_limit_total_wait_seconds"), provider.rate_limit_total_wait_seconds if provider else None, defaults.get("rate_limit_total_wait_seconds")),
+                    120.0,
+                ),
+                extra_headers=_merge_ai_summary_headers(defaults.get("headers"), provider.extra_headers if provider else None, raw_model.get("headers")),
+                chat_completions_path=_normalize_ai_summary_api_path(
+                    _config_value(raw_model.get("chat_completions_path"), provider.chat_completions_path if provider else None, defaults.get("chat_completions_path"), "/chat/completions")
+                ),
+                limit_category=_optional_ai_summary_text(model_limits.get("category")),
+                tpm_limit=_optional_ai_summary_text(model_limits.get("tpm")),
+                rpd_limit=_optional_ai_summary_text(model_limits.get("rpd")),
+            )
+        )
+
+    return AiSummarySettings(models=models)
+
+
+def get_legacy_ai_summary_settings() -> AiSummarySettings:
+    api_base = os.getenv("AI_SUMMARY_API_BASE", "https://opencode.ai/zen/v1").strip().rstrip("/") or "https://opencode.ai/zen/v1"
     model = os.getenv("AI_SUMMARY_MODEL", "minimax-m2.5-free").strip() or "minimax-m2.5-free"
     target_language = os.getenv("AI_SUMMARY_TARGET_LANGUAGE", "ru").strip() or "ru"
     max_input_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_INPUT_CHARS"), 6000)
     timeout_seconds = _parse_ai_summary_int(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS"), 30)
-    max_output_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_OUTPUT_CHARS"), 220)
+    max_output_chars = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_OUTPUT_CHARS"), 440)
+    max_tokens = _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_TOKENS"), 10000)
 
-    return api_base, model, target_language, max_input_chars, timeout_seconds, max_output_chars
+    return AiSummarySettings(
+        models=[
+            AiSummaryModelConfig(
+                name=model,
+                model=model,
+                provider_name="legacy",
+                api_base=api_base,
+                api_key=os.getenv("AI_SUMMARY_API_KEY", "").strip(),
+                auth_type="bearer",
+                api_key_header="x-api-key",
+                api_key_query_param="key",
+                rpm=_parse_ai_summary_int(os.getenv("AI_SUMMARY_RPM"), 10),
+                rate_limit_group="legacy-ai-summary",
+                timeout_seconds=timeout_seconds,
+                max_tokens=max_tokens,
+                max_input_chars=max_input_chars,
+                max_output_chars=max_output_chars,
+                target_language=target_language,
+                temperature=0.2,
+                max_attempts=3,
+                rate_limit_wait_seconds=30.0,
+                max_retry_after_seconds=120.0,
+                rate_limit_total_wait_seconds=120.0,
+                extra_headers={},
+                chat_completions_path="/chat/completions",
+                limit_category="",
+                tpm_limit="",
+                rpd_limit="",
+            )
+        ]
+    )
 
 
-def get_ai_summary_max_tokens(max_output_chars: int) -> int:
-    default_tokens = max(max_output_chars * 6, 1000)
-    return _parse_ai_summary_int(os.getenv("AI_SUMMARY_MAX_TOKENS"), default_tokens)
+def get_ai_summary_settings() -> AiSummarySettings:
+    config_path = env_text("AI_SUMMARY_MODELS_CONFIG")
+    if not config_path:
+        return get_legacy_ai_summary_settings()
+    return load_ai_summary_settings_from_yaml(_resolve_ai_summary_config_path(config_path))
 
 
-def clean_one_line_summary(text: str, max_len: int = 220) -> str:
+def get_ai_summary_limiter(model: AiSummaryModelConfig) -> AiSummaryRpmLimiter:
+    limiter = _AI_SUMMARY_RATE_LIMITERS.get(model.rate_limit_group)
+    if limiter is None or limiter.rpm != max(1, model.rpm):
+        limiter = AiSummaryRpmLimiter(model.rpm)
+        _AI_SUMMARY_RATE_LIMITERS[model.rate_limit_group] = limiter
+    return limiter
+
+
+def strip_release_lead_in(summary: str, source: dict[str, Any], entry: ChangelogEntry) -> str:
+    product = str(source.get("product") or source["id"])
+    version = str(entry.version or entry.item_id or "")
+    version_body = version[1:] if version.lower().startswith("v") else version
+    product_pattern = re.escape(product)
+    version_pattern = rf"v?{re.escape(version_body)}" if version_body else ""
+
+    patterns = []
+    if version_pattern:
+        patterns.extend(
+            [
+                rf"(?i)^(?:{product_pattern}\s+)?{version_pattern}\s*(?:[:—–-]\s*|\s+)",
+                rf"(?i)^в\s+{version_pattern}\s+",
+            ]
+        )
+    patterns.append(rf"(?i)^{product_pattern}\s*(?:[:—–-]\s*|\s+)")
+
+    cleaned = summary.strip()
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, count=1).strip()
+
+    verb_rewrites = {
+        "добавляет": "Добавлен",
+        "включает": "Добавлен",
+        "улучшает": "Улучшен",
+        "исправляет": "Исправлен",
+        "обновляет": "Обновлен",
+    }
+    lowered = cleaned.lower()
+    for active_verb, passive_verb in verb_rewrites.items():
+        if lowered.startswith(active_verb + " "):
+            return passive_verb + cleaned[len(active_verb):]
+
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else cleaned
+
+
+def clean_one_line_summary(
+    text: str,
+    max_len: int = 440,
+    *,
+    source: dict[str, Any] | None = None,
+    entry: ChangelogEntry | None = None,
+) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.strip('"\'«»`')
+
+    if source is not None and entry is not None:
+        text = strip_release_lead_in(text, source, entry)
 
     prefixes = (
         "кратко:",
@@ -2676,131 +3123,268 @@ def save_ai_summary(
     conn.commit()
 
 
+def build_ai_summary_auth_request_parts(model: AiSummaryModelConfig, *, content_type: str | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    headers = dict(model.extra_headers)
+    params: dict[str, str] = {}
+
+    if content_type:
+        headers.setdefault("Content-Type", content_type)
+
+    if model.auth_type == "bearer" and model.api_key:
+        headers.setdefault("Authorization", f"Bearer {model.api_key}")
+    elif model.auth_type == "api-key" and model.api_key:
+        headers.setdefault(model.api_key_header or "x-api-key", model.api_key)
+    elif model.auth_type == "query-key" and model.api_key:
+        params[model.api_key_query_param or "key"] = model.api_key
+
+    return headers, params
+
+
+def build_ai_summary_messages(model: AiSummaryModelConfig, source: dict[str, Any], entry: ChangelogEntry) -> list[dict[str, str]]:
+    product = str(source.get("product") or source["id"])
+    version = entry.version or entry.item_id
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You summarize software release notes for Telegram. "
+                f"Return only the final answer: exactly one short sentence in {model.target_language}. "
+                "No reasoning. No markdown. No bullets. No quotes. Focus on practical changes. "
+                "Do not include the product name, release name, or version in the answer. "
+                "Start directly with the change, preferably with a passive verb such as "
+                "'Добавлен', 'Добавлена', 'Добавлены', 'Исправлен', 'Улучшен'."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Make a concise one-line summary of changes in {model.target_language}. "
+                f"Not longer than {model.max_output_chars} symbols. "
+                "Avoid phrases such as 'this release' and 'the update includes'. "
+                f"Do not mention or start with '{product}', '{version}', or '{product} {version}'; "
+                "start with the actual change instead.\n\n"
+                f"{build_summary_input(source, entry, model.max_input_chars)}"
+            ),
+        },
+    ]
+
+
+def parse_ai_summary_retry_after(response: httpx.Response, fallback_seconds: float) -> float:
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if retry_after:
+        try:
+            return max(1.0, float(retry_after))
+        except ValueError:
+            pass
+    return fallback_seconds
+
+
+def compact_ai_summary_error(text: str, limit: int = 220) -> str:
+    return truncate(re.sub(r"\s+", " ", text).strip(), limit)
+
+
+def extract_ai_summary_content(data: Any) -> tuple[str | None, str | None, list[str]]:
+    if not isinstance(data, dict):
+        return None, None, []
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None, None, []
+
+    first_choice = choices[0]
+    finish_reason = first_choice.get("finish_reason")
+    message = first_choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        message_keys = sorted(str(key) for key in message.keys())
+    else:
+        content = first_choice.get("text")
+        message_keys = []
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        content = "\n".join(parts)
+
+    if content is None:
+        return None, str(finish_reason) if finish_reason is not None else None, message_keys
+    return str(content), str(finish_reason) if finish_reason is not None else None, message_keys
+
+
+def strip_closed_reasoning_blocks(text: str) -> str:
+    cleaned = re.sub(r"(?is)<(?:think|thought)>.*?</(?:think|thought)>", " ", text).strip()
+    return cleaned or text.strip()
+
+
+def is_reasoning_only_summary(text: str) -> bool:
+    return text.lstrip().lower().startswith(("<think>", "<thought>"))
+
+
+def summary_matches_target_language(summary: str, target_language: str) -> bool:
+    language = target_language.strip().lower()
+    if language.startswith("ru"):
+        return bool(re.search(r"[А-Яа-яЁё]", summary))
+    return True
+
+
+async def generate_ai_summary_with_model(
+    client: httpx.AsyncClient,
+    source: dict[str, Any],
+    entry: ChangelogEntry,
+    model: AiSummaryModelConfig,
+) -> str | None:
+    if _ai_summary_auth_requires_key(model.auth_type) and not model.api_key:
+        LOG.warning("AI summary model %s skipped: missing API key", model.label)
+        return None
+
+    payload = {
+        "model": model.model,
+        "stream": False,
+        "temperature": model.temperature,
+        "max_tokens": model.max_tokens,
+        "messages": build_ai_summary_messages(model, source, entry),
+    }
+    headers, params = build_ai_summary_auth_request_parts(model, content_type="application/json")
+    limiter = get_ai_summary_limiter(model)
+    api_url = f"{model.api_base}{model.chat_completions_path}"
+    rate_limit_waited = 0.0
+
+    for attempt in range(1, model.max_attempts + 1):
+        await limiter.wait()
+        try:
+            response = await client.post(api_url, headers=headers, params=params, json=payload, timeout=model.timeout_seconds)
+        except Exception as exc:
+            if attempt >= model.max_attempts:
+                LOG.warning("AI summary model %s request failed for %s/%s: %s", model.label, source["id"], entry.item_id, exc)
+                return None
+            delay = min(model.rate_limit_wait_seconds, float(2 ** attempt))
+            LOG.warning(
+                "AI summary model %s request failed for %s/%s, retrying in %.1fs (attempt %d/%d): %s",
+                model.label,
+                source["id"],
+                entry.item_id,
+                delay,
+                attempt,
+                model.max_attempts,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status_code == 429:
+            delay = parse_ai_summary_retry_after(response, model.rate_limit_wait_seconds)
+            if attempt >= model.max_attempts or delay > model.max_retry_after_seconds or rate_limit_waited + delay > model.rate_limit_total_wait_seconds:
+                LOG.warning(
+                    "AI summary model %s rate-limited for %s/%s: retry_after=%.1fs waited=%.1fs budget=%.1fs: %s",
+                    model.label,
+                    source["id"],
+                    entry.item_id,
+                    delay,
+                    rate_limit_waited,
+                    model.rate_limit_total_wait_seconds,
+                    compact_ai_summary_error(response.text),
+                )
+                return None
+            LOG.warning(
+                "AI summary model %s rate-limited for %s/%s, retrying in %.1fs (attempt %d/%d)",
+                model.label,
+                source["id"],
+                entry.item_id,
+                delay,
+                attempt,
+                model.max_attempts,
+            )
+            await asyncio.sleep(delay)
+            rate_limit_waited += delay
+            continue
+
+        if response.status_code >= 400:
+            LOG.warning(
+                "AI summary model %s failed HTTP %d for %s/%s: %s",
+                model.label,
+                response.status_code,
+                source["id"],
+                entry.item_id,
+                compact_ai_summary_error(response.text),
+            )
+            return None
+
+        try:
+            content, finish_reason, message_keys = extract_ai_summary_content(response.json())
+        except Exception as exc:
+            LOG.warning("AI summary model %s returned invalid JSON for %s/%s: %s", model.label, source["id"], entry.item_id, exc)
+            return None
+
+        if content is None:
+            LOG.warning(
+                "AI summary model %s returned empty content for %s/%s; finish_reason=%r message_keys=%s",
+                model.label,
+                source["id"],
+                entry.item_id,
+                finish_reason,
+                message_keys,
+            )
+            return None
+
+        if is_reasoning_only_summary(content):
+            LOG.warning("AI summary model %s returned reasoning-only content for %s/%s", model.label, source["id"], entry.item_id)
+            return None
+
+        cleaned_content = strip_closed_reasoning_blocks(content)
+        summary = clean_one_line_summary(cleaned_content, max_len=model.max_output_chars, source=source, entry=entry)
+        if not summary:
+            LOG.warning(
+                "AI summary model %s returned empty cleaned content for %s/%s; raw_content=%r",
+                model.label,
+                source["id"],
+                entry.item_id,
+                truncate(re.sub(r"\s+", " ", content).strip(), 200),
+            )
+            return None
+        if not summary_matches_target_language(summary, model.target_language):
+            LOG.warning(
+                "AI summary model %s returned non-%s summary for %s/%s: %r",
+                model.label,
+                model.target_language,
+                source["id"],
+                entry.item_id,
+                truncate(summary, 200),
+            )
+            return None
+        return summary
+
+    return None
+
+
 async def generate_ai_summary(
     client: httpx.AsyncClient,
     source: dict[str, Any],
     entry: ChangelogEntry,
-) -> str | None:
+) -> tuple[str, AiSummaryModelConfig] | None:
     if not ai_summary_enabled():
         return None
 
-    api_key = os.getenv("AI_SUMMARY_API_KEY", "").strip()
-    if not api_key:
-        LOG.warning("AI_SUMMARY_ENABLED=true but AI_SUMMARY_API_KEY is empty")
-        return None
-
-    api_base, model, target_language, max_input_chars, timeout_seconds, max_output_chars = get_ai_summary_settings()
-
-    payload = {
-        "model": model,
-        "stream": False,
-        "temperature": 0.2,
-        "max_tokens": get_ai_summary_max_tokens(max_output_chars),
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You summarize software release notes for Telegram. "
-                    f"Return exactly one short sentence in {target_language}. "
-                    "No markdown. No bullets. No quotes. "
-                    "Do not mention that this is a release. "
-                    "Focus on practical changes."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Make a concise one-line summary of changes in {target_language}. "
-                    f"Not longer than {max_output_chars} symbols. "
-                    "Avoid phrases such as 'this release' and 'the update includes'.\n\n"
-                    f"{build_summary_input(source, entry, max_input_chars)}"
-                ),
-            },
-        ],
-    }
-
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = await client.post(
-                f"{api_base}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            break
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code
-            if status_code == 429 and attempt < max_attempts:
-                retry_after = exc.response.headers.get("Retry-After", "").strip()
-                try:
-                    delay = max(1.0, min(float(retry_after), 30.0)) if retry_after else float(2 ** attempt)
-                except ValueError:
-                    delay = float(2 ** attempt)
-                LOG.warning(
-                    "[%s] AI summary rate limited for %s, retrying in %.1fs (attempt %d/%d)",
-                    source["id"],
-                    entry.item_id,
-                    delay,
-                    attempt,
-                    max_attempts,
-                )
-                await asyncio.sleep(delay)
-                continue
-            LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
-            return None
-        except Exception:
-            LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
-            return None
-
     try:
-        data = response.json()
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            LOG.warning("AI summary response for %s has no choices", source["id"])
-            return None
-
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            LOG.warning("AI summary response for %s has invalid choice payload", source["id"])
-            return None
-
-        finish_reason = first_choice.get("finish_reason")
-
-        message = first_choice.get("message")
-        if not isinstance(message, dict):
-            LOG.warning("AI summary response for %s has invalid message payload", source["id"])
-            return None
-
-        content = message.get("content")
-        if content is None:
-            LOG.warning(
-                "AI summary response for %s/%s has empty content; finish_reason=%r message_keys=%s",
-                source["id"],
-                entry.item_id,
-                finish_reason,
-                sorted(str(key) for key in message.keys()),
-            )
-            return None
-
-        summary = clean_one_line_summary(str(content), max_len=max_output_chars)
-        if not summary:
-            raw_content = re.sub(r"\s+", " ", str(content)).strip()
-            LOG.warning(
-                "AI summary response for %s/%s has empty cleaned content; raw_content=%r",
-                source["id"],
-                entry.item_id,
-                truncate(raw_content, 200),
-            )
-            return None
-        return summary
+        settings = get_ai_summary_settings()
     except Exception:
-        LOG.exception("[%s] failed to generate AI summary for %s", source["id"], entry.item_id)
+        LOG.exception("failed to load AI summary model settings")
         return None
+
+    for index, model in enumerate(settings.models, start=1):
+        summary = await generate_ai_summary_with_model(client, source, entry, model)
+        if summary:
+            if index > 1:
+                LOG.info("AI summary fallback selected model %s for %s/%s", model.label, source["id"], entry.item_id)
+            return summary, model
+
+    LOG.warning("all AI summary models failed for %s/%s", source["id"], entry.item_id)
+    return None
 
 
 async def get_or_generate_ai_summary(
@@ -2815,27 +3399,45 @@ async def get_or_generate_ai_summary(
     if not ai_summary_enabled():
         return None
 
-    _, model, target_language, _, _, _ = get_ai_summary_settings()
-    cache_key = (source["id"], entry.item_id, model, target_language)
-    if cycle_cache is not None and cache_key in cycle_cache:
-        return cycle_cache[cache_key]
+    try:
+        settings = get_ai_summary_settings()
+    except Exception:
+        LOG.exception("failed to load AI summary model settings")
+        return None
 
-    cached = load_ai_summary(conn, source["id"], entry.item_id, model, target_language)
-    if cached:
-        if cycle_cache is not None:
-            cycle_cache[cache_key] = cached
-        return cached
+    for model in settings.models:
+        cache_key = (source["id"], entry.item_id, model.cache_key, model.target_language)
+        if cycle_cache is not None and cache_key in cycle_cache:
+            cached_cycle_value = cycle_cache[cache_key]
+            if cached_cycle_value:
+                return cached_cycle_value
+            continue
+
+        cached = load_ai_summary(conn, source["id"], entry.item_id, model.cache_key, model.target_language)
+        if cached:
+            if cycle_cache is not None:
+                cycle_cache[cache_key] = cached
+            return cached
 
     if dry_run and not ai_summary_dry_run_call_api_enabled():
         if cycle_cache is not None:
-            cycle_cache[cache_key] = None
+            for model in settings.models:
+                cycle_cache[(source["id"], entry.item_id, model.cache_key, model.target_language)] = None
         return None
 
-    summary = await generate_ai_summary(client, source, entry)
-    if summary and not dry_run:
-        save_ai_summary(conn, source["id"], entry.item_id, model, target_language, summary)
-    if cycle_cache is not None:
-        cycle_cache[cache_key] = summary
+    generated = await generate_ai_summary(client, source, entry)
+    summary = None
+    if generated:
+        summary, used_model = generated
+        cache_key = (source["id"], entry.item_id, used_model.cache_key, used_model.target_language)
+        if not dry_run:
+            save_ai_summary(conn, source["id"], entry.item_id, used_model.cache_key, used_model.target_language, summary)
+        if cycle_cache is not None:
+            cycle_cache[cache_key] = summary
+    elif cycle_cache is not None:
+        for model in settings.models:
+            cache_key = (source["id"], entry.item_id, model.cache_key, model.target_language)
+            cycle_cache[cache_key] = None
 
     return summary
 
@@ -4767,6 +5369,14 @@ def validate_config_files(config_path: str, db_path: str, *, migrate_db: bool = 
         get_routing_seed_mode()
     except Exception as exc:
         errors.append(str(exc))
+
+    if ai_summary_enabled():
+        try:
+            settings = get_ai_summary_settings()
+            if not settings.models:
+                errors.append("AI summary config: no models configured")
+        except Exception as exc:
+            errors.append(f"AI summary config: {exc}")
 
     try:
         db_factory = db_connect if migrate_db else db_connect_for_dry_run

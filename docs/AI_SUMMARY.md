@@ -6,19 +6,44 @@
 
 ```env
 AI_SUMMARY_ENABLED=false
+AI_SUMMARY_MODELS_CONFIG=ai-summary-models.local.yaml
 AI_SUMMARY_API_BASE=https://opencode.ai/zen/v1
 AI_SUMMARY_API_KEY=
 AI_SUMMARY_MODEL=minimax-m2.5-free
 AI_SUMMARY_TARGET_LANGUAGE=ru
 AI_SUMMARY_MAX_INPUT_CHARS=6000
 AI_SUMMARY_TIMEOUT_SECONDS=30
-AI_SUMMARY_MAX_OUTPUT_CHARS=220
-AI_SUMMARY_MAX_TOKENS=1200
+AI_SUMMARY_MAX_OUTPUT_CHARS=440
+AI_SUMMARY_MAX_TOKENS=10000
 AI_SUMMARY_DRY_RUN_CALL_API=false
 AI_SUMMARY_IN_DIGEST=true
+GOOGLE_API_KEY=
+OPENROUTER_API_KEY=
+OLLAMA_API_KEY=
 ```
 
-По умолчанию AI summary выключены.
+По умолчанию AI summary выключены. Если `AI_SUMMARY_MODELS_CONFIG` задан, бот берёт провайдеры, лимиты и ordered fallback-список моделей из YAML. Если YAML не задан, остаётся legacy-режим через `AI_SUMMARY_API_BASE` + `AI_SUMMARY_MODEL`.
+
+Runtime-конфиг моделей создаётся из example:
+
+```bash
+cp ai-summary-models.example.yaml ai-summary-models.local.yaml
+```
+
+В `ai-summary-models.local.yaml` можно менять порядок `models`, удалять модели или добавлять новые. Бот пробует модели сверху вниз: первая успешная русскоязычная summary сохраняется в cache и используется в сообщении. Ошибки API, rate limit, пустой ответ, reasoning-only ответ или ответ не на целевом языке переводят генерацию к следующей модели.
+
+Текущий рекомендуемый порядок:
+
+| Приоритет | Модель | Провайдер / маршрут | Роль |
+|---:|---|---|---|
+| 1 | `google-gemini-2-5-flash-lite` | Google | Primary, если Google-лимиты не мешают. |
+| 2 | `ollama-devstral-small-2-24b` | Ollama | Лучший Ollama primary. |
+| 3 | `ollama-devstral-2-123b` | Ollama | Fallback с похожим качеством. |
+| 4 | `openrouter-openai-gpt-oss-20b-free` | OpenRouter / OpenAI | Внешний fallback. |
+| 5 | `ollama-qwen3-coder-next` | Ollama | Fallback для технических changelog. |
+| 6 | `ollama-qwen3-vl-235b-instruct` | Ollama | Fallback, если доступен. |
+| 7 | `ollama-ministral-3-14b` | Ollama | Более подробный fallback. |
+| 8 | `ollama-ministral-3-8b` | Ollama | Максимум деталей, не основной Telegram-режим. |
 
 ## Cache
 
@@ -28,7 +53,7 @@ AI_SUMMARY_IN_DIGEST=true
 source_id + item_id + model + target_language
 ```
 
-Если OpenCode Zen не отвечает или ключ пустой, бот отправляет обычное сообщение без AI summary и продолжает работу.
+Если все модели недоступны или ключи пустые, бот отправляет обычное сообщение без AI summary и продолжает работу.
 
 ## Dry-Run
 
@@ -70,6 +95,36 @@ python scripts/compare-model-summaries.py --models-config scripts/model-summary-
 Конфиг поддерживает `providers`: модель может указать `provider: opencode-zen` и унаследовать `api_base`, `auth_type`, `api_key_env`/`api_key`, `rpm`, `models_path`, `chat_completions_path` и retry-настройки. Любое из этих полей можно переопределить на уровне конкретной модели. `concurrent_models` по умолчанию равен `1`; его можно переопределить в YAML или через `--concurrent-models`.
 
 Поддержанные типы авторизации: `bearer`, `api-key`, `query-key`, `none`. В example config уже есть провайдеры `opencode-zen`, `google`, `openrouter`, `ollama`. Команда `--list-provider-models` выводит id моделей и помечает `FREE`/`LOCAL`, когда это можно определить из ответа провайдера или имени модели.
+
+Для устойчивого отсеивания моделей, которые не подходят для chat/completions, часто rate-limitятся или временно отваливаются, используется локальный файл решений `data/model-decisions.yaml`. Он не коммитится, потому что это runtime-результат экспериментов. Создать шаблон можно так:
+
+```bash
+cp scripts/model-decisions.example.yaml data/model-decisions.yaml
+```
+
+Формат:
+
+```yaml
+models:
+  google:deep-research-preview-04-2026:
+    action: skip
+    reason: google_interactions_api_only
+    note: Requires Interactions API, not chat/completions.
+  openrouter:some-model:
+    action: retry_later
+    reason: rate_limit_observed
+```
+
+`action: skip` и `action: retry_later` скрывают модель из списков и UI по умолчанию. Чтобы увидеть скрытые модели, используй `--include-hidden-models`.
+
+Статусы в Markdown-таблице сравнения:
+
+| Статус | Значение |
+|---|---|
+| `🔵 Active/Success` | Модель вернула пригодный ответ. |
+| `⚠️ Rate Limit` | Модель упёрлась в RPM/quota/concurrent/rate-limit; можно повторить позже или снизить concurrency. |
+| `🟡 Warning/Caution` | Временная или условная проблема без полного исключения модели: high demand, credits/subscription, empty/reasoning-only. |
+| `🔴 Error/Danger` | Остальные ошибки, обычно требующие исключения модели или отдельного адаптера. |
 
 Полезные режимы:
 
