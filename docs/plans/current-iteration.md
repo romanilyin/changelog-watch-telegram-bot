@@ -1,17 +1,12 @@
 # Current Iteration
 
-## Iteration 7: Hardening And Final Docs
+## Post-MVP / Backlog
 
-Цель: финальная стабилизация runtime admin UX и документации перед регулярной эксплуатацией.
+Runtime admin UX MVP завершён. Новую работу лучше сначала фиксировать как явные post-MVP backlog items, а потом выносить в отдельные итерации.
 
-## Scope
+Кандидаты для backlog:
 
-- Проверить edge cases admin commands и HTML-safe ответы.
-- Уточнить финальные setup/runbook docs.
-- Пройти локальные smoke checks перед эксплуатацией.
-
-## Out Of Scope
-
-- Новые Telegram dependencies/frameworks.
-- Изменение provider/model ключей и `ai-summary-models.local.yaml` из Telegram.
-- Полноценный web UI.
+- Web/admin UI, если Telegram-команд станет недостаточно.
+- Дополнительные source providers или parser types.
+- Более подробный audit/export tooling для operational changes.
+- Больше automated integration checks вокруг Telegram API behavior.

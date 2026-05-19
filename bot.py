@@ -655,7 +655,7 @@ def format_pending_sources_command(conn: sqlite3.Connection) -> str:
         lines.append(
             f"<code>{html.escape(row['token'])}</code> <code>{html.escape(row['source_id'])}</code> "
             f"action={html_escape_value(row['action'])} by={requester}\n"
-            f"{row['preview_text']}\n"
+            f"{html_escape_value(row['preview_text'])}\n"
             f"<code>/confirmsource {html.escape(row['token'])}</code>\n"
             f"<code>/rejectsource {html.escape(row['token'])}</code>"
         )
@@ -824,6 +824,91 @@ def format_help_command() -> str:
             "/subscriptions [chat_id|alias]",
         ]
     )
+
+
+def self_test_admin_helpers() -> None:
+    routing = RoutingConfig(
+        admins={"123"},
+        admin_aliases={"root<admin>": "123"},
+        source_groups={"all&more": {"source<one>"}},
+        chats={
+            "-100": ChatRouting(
+                chat_id="-100",
+                groups={"all&more"},
+                source_ids={"source<one>"},
+                title="Chat <Title>",
+                alias="main&ops",
+                enabled=True,
+                delivery_mode="instant",
+            )
+        },
+    )
+    sources = [
+        {
+            "id": "source<one>",
+            "product": "Product <One>",
+            "type": "github_releases",
+            "enabled": True,
+        }
+    ]
+
+    with db_connect(":memory:") as conn:
+        conn.execute(
+            """
+            INSERT INTO pending_sources(
+                token, source_id, config_yaml, preview_text, requested_by_user_id,
+                requested_by_name, action, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tok<1>",
+                "source<one>",
+                "id: source<one>\n",
+                "<b>unsafe preview</b> & text",
+                "123",
+                "User <Name>",
+                "upsert",
+                "2026-05-19T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+        outputs = [
+            format_admins_command(routing),
+            format_chats_command(routing),
+            format_sources_command(sources),
+            format_source_details_command("source<one>", sources, routing),
+            format_subscriptions_command("-100", routing),
+            format_pending_sources_command(conn),
+            format_status_command(sources, routing, conn, poll_minutes=30, db_path="data/test.sqlite3"),
+        ]
+
+    joined = "\n---\n".join(outputs)
+    expected_fragments = [
+        "root&lt;admin&gt;",
+        "main&amp;ops",
+        "Chat &lt;Title&gt;",
+        "Product &lt;One&gt;",
+        "source&lt;one&gt;",
+        "User &lt;Name&gt;",
+        "&lt;b&gt;unsafe preview&lt;/b&gt; &amp; text",
+        "db=<code>data/test.sqlite3</code>",
+    ]
+    missing = [fragment for fragment in expected_fragments if fragment not in joined]
+    if missing:
+        raise AssertionError(f"admin helper self-test missing escaped fragments: {missing}")
+
+    forbidden_fragments = [
+        "root<admin>",
+        "Chat <Title>",
+        "Product <One>",
+        "User <Name>",
+        "<b>unsafe preview</b>",
+    ]
+    leaked = [fragment for fragment in forbidden_fragments if fragment in joined]
+    if leaked:
+        raise AssertionError(f"admin helper self-test found unescaped fragments: {leaked}")
+
+    print("admin helper self-test passed")
 
 
 def chunk_telegram_html_message(text: str, max_chars: int = 3500) -> list[str]:
@@ -4830,6 +4915,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replace", action="store_true", help="Replace routing tables during --import-routing or --import-settings")
     parser.add_argument("--clear-summary-queue", action="store_true", help="Clear digest summary queue without network calls")
     parser.add_argument("--chat-id", help="Limit --clear-summary-queue to one Telegram chat id")
+    parser.add_argument("--self-test-admin-helpers", action="store_true", help="Run side-effect-free admin formatting helper checks")
     args = parser.parse_args()
 
     if args.migrate_db and not args.validate_config:
@@ -4838,12 +4924,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--replace requires --import-routing or --import-settings")
     if args.chat_id and not args.clear_summary_queue:
         parser.error("--chat-id requires --clear-summary-queue")
-    if args.validate_config and (args.import_routing or args.export_settings or args.import_settings or args.clear_summary_queue):
-        parser.error("--validate-config cannot be combined with import/export/clear commands")
+    if args.validate_config and (args.import_routing or args.export_settings or args.import_settings or args.clear_summary_queue or args.self_test_admin_helpers):
+        parser.error("--validate-config cannot be combined with import/export/clear/self-test commands")
     if args.import_routing and (args.export_settings or args.import_settings):
         parser.error("--import-routing cannot be combined with --export-settings or --import-settings")
     if args.export_settings and args.import_settings:
         parser.error("--export-settings cannot be combined with --import-settings")
+    if args.self_test_admin_helpers and (args.import_routing or args.export_settings or args.import_settings or args.clear_summary_queue):
+        parser.error("--self-test-admin-helpers cannot be combined with import/export/clear commands")
 
     return args
 
@@ -4855,6 +4943,9 @@ def main() -> None:
     warn_legacy_telegram_chat_id()
     if args.validate_config:
         validate_config_files(args.config, args.db, migrate_db=args.migrate_db)
+        return
+    if args.self_test_admin_helpers:
+        self_test_admin_helpers()
         return
     if args.import_routing:
         import_routing_from_seed(args.config, args.db, replace=args.replace)

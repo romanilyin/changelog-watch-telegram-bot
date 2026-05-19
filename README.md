@@ -36,6 +36,7 @@ python bot.py --import-routing --replace
 python bot.py --export-settings data/settings-backup.yaml
 python bot.py --import-settings data/settings-backup.yaml --replace
 python bot.py --clear-summary-queue --chat-id 185073278
+python bot.py --self-test-admin-helpers
 python bot.py --once --dry-run
 python bot.py --once
 python bot.py
@@ -89,6 +90,31 @@ Windows PowerShell 7 + WSL:
 - `/testsource`, `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource` — safe source management через staging/approval; source validation использует текущий parser/network path.
 - `/reload`, `/status`, `/subscriptions [chat_id|alias]` — operational read-команды для admins.
 - `/subscribe` (`/link`), `/unsubscribe` (`/unlink`), `/subscribe_here`, `/unsubscribe_here` — admin-команды подписок с routing reload.
+
+## Admin Runbook
+
+1. Setup: скопируй примеры без секретов, заполни локальные значения и проверь конфиг.
+
+```bash
+cp .env.example .env
+cp admin-routing.example.yaml admin-routing.yaml
+python bot.py --validate-config
+```
+
+2. Backup/restore runtime settings: экспортируй SQLite routing/source settings в YAML и восстанавливай через `--import-settings --replace`.
+
+```bash
+python bot.py --export-settings data/settings-backup.yaml
+python bot.py --import-settings data/settings-backup.yaml --replace
+```
+
+3. Add a chat: в нужном Telegram-чате выполни `/requestchat alias`, затем admin подтверждает `/approvechat <chat_id> alias`; для private chat можно использовать `/addme alias`.
+
+4. Add a source: admin проверяет и staging-ит источник через `/addrepo <owner/repo|github_url> [source_id] [product name...]` или `/addsource <source_id> <type> <url> | <product name>`, затем применяет `/confirmsource <token>`.
+
+5. Subscribe: добавь источник в чат через `/subscribe <source_id> [chat_id|alias]`, `/link <source_id> <chat_id|alias>` или `/subscribe_here <source_id>`.
+
+6. Check status: используй `/status`, `/subscriptions [chat_id|alias]`, `/chats`, `/sources` и `/source <source_id>`; локально можно запустить `python bot.py --self-test-admin-helpers`.
 
 ## Документация
 

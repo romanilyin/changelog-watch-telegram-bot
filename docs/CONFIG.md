@@ -248,6 +248,12 @@ python bot.py --validate-config
 python bot.py --validate-config --migrate-db
 ```
 
+Лёгкая проверка admin formatting helpers без network calls и без записи в DB-файл:
+
+```bash
+python bot.py --self-test-admin-helpers
+```
+
 Проверяется:
 
 - `products.yaml` загружается;
@@ -342,3 +348,34 @@ Dry-run:
 Команды `/id`, `/requestchat [alias]` и `/addme [alias]` доступны любому пользователю. `/addme` работает только в private chat. Pending-заявки сохраняются в SQLite с chat metadata и не раскрывают `.env`/secrets.
 
 Изменения пишутся в SQLite и сохраняются при рестарте. Они не перетираются seed-файлом в `ROUTING_SEED_MODE=once`.
+
+## Admin Runbook
+
+1. Setup: создай локальные файлы из примеров, заполни только свои значения и проверь конфиг.
+
+```bash
+cp .env.example .env
+cp admin-routing.example.yaml admin-routing.yaml
+python bot.py --validate-config
+```
+
+2. Backup: сохрани runtime routing/source settings из SQLite в YAML.
+
+```bash
+python bot.py --export-settings data/settings-backup.yaml
+```
+
+3. Restore: восстанови settings YAML в текущую или отдельную SQLite DB.
+
+```bash
+python bot.py --import-settings data/settings-backup.yaml --replace
+python bot.py --import-settings data/settings-backup.yaml --replace --db data/restored.sqlite3
+```
+
+4. Add a chat: пользователь отправляет `/requestchat alias` в нужном чате или `/addme alias` в private chat; admin смотрит `/pending` и подтверждает `/approvechat <chat_id> alias` или отклоняет `/rejectchat <chat_id>`.
+
+5. Add a source: admin использует `/addrepo <owner/repo|github_url> [source_id] [product name...]` для GitHub Releases или `/addsource <source_id> <type> <url> | <product name>` для supported source type; затем смотрит `/pendingsources` и применяет `/confirmsource <token>` или `/rejectsource <token>`.
+
+6. Subscribe: admin связывает источник и чат через `/subscribe <source_id> [chat_id|alias]`, `/link <source_id> <chat_id|alias>` или `/subscribe_here <source_id>`; убрать подписку можно через `/unsubscribe`, `/unlink` или `/unsubscribe_here`.
+
+7. Check status: используй `/status` для safe counts, `/subscriptions [chat_id|alias]` для подписок, `/chats` для чатов, `/sources` для источников и `/source <source_id>` для деталей.

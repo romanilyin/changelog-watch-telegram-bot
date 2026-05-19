@@ -81,3 +81,11 @@
 - Добавлена safe operational команда `/status` с runtime counts, `poll_minutes` и безопасной меткой DB path.
 - Mutating subscription commands пишут SQLite и запрашивают routing reload.
 - `/help`, `README.md` и `docs/CONFIG.md` обновлены минимально.
+
+## Iteration 7: Hardening And Final Docs
+
+- Проверены admin command formatting helpers на HTML-safe runtime values.
+- Закрыт edge case с raw `pending_sources.preview_text` в `/pendingsources`.
+- Добавлен optional CLI `--self-test-admin-helpers` с in-memory проверками без network calls и записи в DB-файл.
+- `README.md` и `docs/CONFIG.md` дополнены кратким admin runbook: setup, backup/restore, добавление чата, добавление источника, подписка и status checks.
+- `docs/plans/current-iteration.md` переведён в post-MVP/backlog pointer.
