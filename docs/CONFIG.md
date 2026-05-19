@@ -226,7 +226,11 @@ sources:
 
 `source.id` — ключ дедупликации в SQLite. Если изменить id, старые entries будут выглядеть как новые.
 
-`--export-settings` и `--import-settings` включают runtime source definitions вместе с routing-настройками. Runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries` и `source_state` не экспортируются и не удаляются при `--import-settings --replace`.
+Telegram admins могут управлять runtime sources через staging flow: `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource`. Перед staging бот вызывает обычный `parse_source` path и требует хотя бы одну найденную entry; provider/model/API keys через Telegram не настраиваются.
+
+`/removesource <source_id>` удаляет только source definition и только если он не используется в `source_groups` или direct chat subscriptions. History/runtime tables не удаляются.
+
+`--export-settings` и `--import-settings` включают runtime source definitions вместе с routing-настройками. Pending staging rows `pending_sources` и runtime/history tables `posted_items`, `deliveries`, `summary_queue`, `ai_summaries` и `source_state` не экспортируются и не удаляются при `--import-settings --replace`.
 
 ## Validation
 

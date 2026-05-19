@@ -18,6 +18,7 @@ import errno
 import hashlib
 import os
 import re
+import secrets
 import signal
 import tempfile
 from collections import defaultdict
@@ -636,6 +637,31 @@ def format_pending_chats_command(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def format_pending_sources_command(conn: sqlite3.Connection) -> str:
+    rows = conn.execute(
+        """
+        SELECT token, source_id, preview_text, requested_by_user_id, requested_by_name, action, created_at
+        FROM pending_sources
+        ORDER BY created_at, source_id
+        """
+    ).fetchall()
+    lines = ["<b>Pending source changes</b>"]
+    if not rows:
+        lines.append("No pending source changes.")
+        return "\n".join(lines)
+
+    for row in rows:
+        requester = html_escape_value(row["requested_by_name"] or row["requested_by_user_id"])
+        lines.append(
+            f"<code>{html.escape(row['token'])}</code> <code>{html.escape(row['source_id'])}</code> "
+            f"action={html_escape_value(row['action'])} by={requester}\n"
+            f"{row['preview_text']}\n"
+            f"<code>/confirmsource {html.escape(row['token'])}</code>\n"
+            f"<code>/rejectsource {html.escape(row['token'])}</code>"
+        )
+    return "\n".join(lines)
+
+
 def format_sources_command(sources: list[dict[str, Any]]) -> str:
     lines = ["<b>Sources</b>"]
     if not sources:
@@ -685,6 +711,19 @@ def format_source_details_command(source_id: str, sources: list[dict[str, Any]],
     return "\n".join(lines)
 
 
+def format_source_preview(source: dict[str, Any], entries: list[ChangelogEntry]) -> str:
+    lines = [
+        f"<b>Source preview</b> {html_escape_value(source.get('product') or source.get('id'))}",
+        f"id=<code>{html_escape_value(source.get('id'))}</code> type={html_escape_value(source.get('type'))}",
+    ]
+    for entry in entries[:3]:
+        title = html_escape_value(entry.title or entry.version or entry.item_id)
+        version = html_escape_value(entry.version or entry.item_id)
+        url = html.escape(entry.url, quote=True)
+        lines.append(f"- <b>{title}</b> <code>{version}</code> <a href=\"{url}\">link</a>")
+    return "\n".join(lines)
+
+
 def format_id_command(message: dict[str, Any]) -> str:
     raw_user_id = (message.get("from") or {}).get("id")
     raw_chat_id = (message.get("chat") or {}).get("id")
@@ -705,6 +744,11 @@ def format_help_command() -> str:
             "/pending",
             "/sources or /projects",
             "/source &lt;source_id&gt; or /info &lt;source_id&gt;",
+            "/testsource &lt;source_id&gt;",
+            "/addrepo &lt;owner/repo|github_url&gt; [source_id] [product name...]",
+            "/addsource &lt;source_id&gt; &lt;type&gt; &lt;url&gt; | &lt;product name&gt;",
+            "/pendingsources /confirmsource &lt;token&gt; /rejectsource &lt;token&gt;",
+            "/enablesource &lt;source_id&gt; /disablesource &lt;source_id&gt; /removesource &lt;source_id&gt;",
             "/reload",
             "/approvechat &lt;chat_id&gt; [alias]",
             "/rejectchat &lt;chat_id&gt;",
@@ -819,6 +863,179 @@ def import_sources_to_db(
 
     if commit:
         conn.commit()
+
+
+def generate_pending_source_token(conn: sqlite3.Connection) -> str:
+    for _ in range(20):
+        token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        if not conn.execute("SELECT 1 FROM pending_sources WHERE token = ?", (token,)).fetchone():
+            return token
+    raise RuntimeError("failed to generate unique pending source token")
+
+
+def stage_pending_source_db(
+    conn: sqlite3.Connection,
+    source: dict[str, Any],
+    preview_text: str,
+    message: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    source_id = normalize_source_id(source.get("id"))
+    validate_source_config({"sources": [dict(source)]})
+    user = message.get("from") or {}
+    user_id = normalize_chat_id(user.get("id"), "from.id") if user.get("id") is not None else None
+    token = generate_pending_source_token(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO pending_sources(
+            token, source_id, config_yaml, preview_text, requested_by_user_id,
+            requested_by_name, action, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            source_id,
+            source_config_to_yaml_text(source),
+            preview_text,
+            user_id,
+            requested_by_name(user),
+            action,
+            now,
+        ),
+    )
+    conn.commit()
+    return token
+
+
+def apply_pending_source_db(conn: sqlite3.Connection, token: str) -> str:
+    row = conn.execute("SELECT * FROM pending_sources WHERE token = ?", (token,)).fetchone()
+    if row is None:
+        raise ValueError(f"pending source token '{token}' not found")
+    source = parse_source_config_text(row["source_id"], row["config_yaml"])
+    import_sources_to_db(conn, [source], replace=False, commit=False)
+    conn.execute("DELETE FROM pending_sources WHERE token = ?", (token,))
+    conn.commit()
+    return row["source_id"]
+
+
+def reject_pending_source_db(conn: sqlite3.Connection, token: str) -> str:
+    row = conn.execute("SELECT source_id FROM pending_sources WHERE token = ?", (token,)).fetchone()
+    if row is None:
+        raise ValueError(f"pending source token '{token}' not found")
+    conn.execute("DELETE FROM pending_sources WHERE token = ?", (token,))
+    conn.commit()
+    return row["source_id"]
+
+
+def set_source_enabled_db(conn: sqlite3.Connection, source_id: str, enabled: bool) -> str:
+    normalized_source_id = normalize_source_id(source_id)
+    row = conn.execute("SELECT config_yaml FROM runtime_sources WHERE source_id = ?", (normalized_source_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"source '{normalized_source_id}' not found")
+    source = parse_source_config_text(normalized_source_id, row["config_yaml"])
+    source["enabled"] = bool(enabled)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE runtime_sources SET config_yaml = ?, updated_at = ? WHERE source_id = ?",
+        (source_config_to_yaml_text(source), now, normalized_source_id),
+    )
+    conn.commit()
+    return normalized_source_id
+
+
+def remove_source_db(conn: sqlite3.Connection, source_id: str) -> str:
+    normalized_source_id = normalize_source_id(source_id)
+    group_refs = conn.execute(
+        "SELECT group_name FROM routing_source_group_sources WHERE source_id = ? ORDER BY group_name",
+        (normalized_source_id,),
+    ).fetchall()
+    chat_refs = conn.execute(
+        "SELECT chat_id FROM routing_chat_sources WHERE source_id = ? ORDER BY CAST(chat_id AS INTEGER)",
+        (normalized_source_id,),
+    ).fetchall()
+    if group_refs or chat_refs:
+        groups = ", ".join(row["group_name"] for row in group_refs) or "-"
+        chats = ", ".join(row["chat_id"] for row in chat_refs) or "-"
+        raise ValueError(
+            f"source '{normalized_source_id}' is still referenced. "
+            f"Unlink it first from groups: {groups}; chats: {chats}"
+        )
+    cursor = conn.execute("DELETE FROM runtime_sources WHERE source_id = ?", (normalized_source_id,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise ValueError(f"source '{normalized_source_id}' not found")
+    return normalized_source_id
+
+
+def build_github_release_source(repo_or_url: str, source_id: str | None = None, product: str | None = None) -> dict[str, Any]:
+    repo_text = normalize_string(repo_or_url)
+    if not repo_text:
+        raise ValueError("repository must be provided")
+    if repo_text.startswith("http://") or repo_text.startswith("https://"):
+        owner, repo = github_repo_from_url(repo_text)
+        url = f"https://github.com/{owner}/{repo}/releases"
+    else:
+        parts = [part for part in repo_text.strip("/").split("/") if part]
+        if len(parts) != 2:
+            raise ValueError("repository must be owner/repo or a github.com URL")
+        owner, repo = parts
+        url = f"https://github.com/{owner}/{repo}/releases"
+    resolved_source_id = normalize_source_id(source_id or f"{owner}_{repo}_releases")
+    return {
+        "id": resolved_source_id,
+        "product": normalize_string(product) or resolved_source_id,
+        "type": "github_releases",
+        "url": url,
+        "include_prereleases": True,
+        "post_on_first_run": False,
+        "max_body_chars": 2500,
+    }
+
+
+def build_source_from_command(source_id: str, source_type: str, url: str, product: str | None = None) -> dict[str, Any]:
+    normalized_source_id = normalize_source_id(source_id)
+    normalized_type = normalize_string(source_type).lower()
+    if normalized_type not in {"html_changelog", "markdown_changelog", "github_releases"}:
+        raise ValueError("source type must be html_changelog, markdown_changelog or github_releases")
+    source: dict[str, Any] = {
+        "id": normalized_source_id,
+        "product": normalize_string(product) or normalized_source_id,
+        "type": normalized_type,
+        "url": normalize_string(url),
+        "post_on_first_run": False,
+        "max_body_chars": 2500,
+    }
+    if normalized_type == "github_releases":
+        owner, repo = github_repo_from_url(source["url"])
+        source["url"] = f"https://github.com/{owner}/{repo}/releases"
+        source["include_prereleases"] = True
+    if normalized_type == "markdown_changelog":
+        source["skip_unreleased"] = True
+    validate_source_config({"sources": [source]})
+    return source
+
+
+def parse_addsource_args(args: list[str]) -> dict[str, str | None]:
+    if len(args) < 3:
+        raise ValueError("Usage: /addsource <source_id> <type> <url> | <product name>")
+    source_id, source_type, url = args[:3]
+    product_tokens = args[3:]
+    if product_tokens and product_tokens[0] == "|":
+        product_tokens = product_tokens[1:]
+    elif product_tokens and product_tokens[0].startswith("|"):
+        product_tokens[0] = product_tokens[0][1:]
+    product = " ".join(token for token in product_tokens if token).strip() or None
+    return {"source_id": source_id, "source_type": source_type, "url": url, "product": product}
+
+
+async def validate_source_via_parser(client: httpx.AsyncClient, source: dict[str, Any]) -> list[ChangelogEntry]:
+    validate_source_config({"sources": [dict(source)]})
+    entries = await parse_source(client, source)
+    if not entries:
+        raise ValueError(f"source '{source['id']}' parsed successfully but returned no entries")
+    return entries
 
 
 def ensure_source_state_seeded(conn: sqlite3.Connection, config_path: str | Path) -> None:
@@ -1928,6 +2145,23 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_chats_created_at ON pending_chats(created_at)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_sources (
+            token TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            config_yaml TEXT NOT NULL,
+            preview_text TEXT NOT NULL,
+            requested_by_user_id TEXT,
+            requested_by_name TEXT,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_sources_created_at ON pending_sources(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_sources_source_id ON pending_sources(source_id)")
 
 
 def initialize_database_schema(conn: sqlite3.Connection) -> None:
@@ -3293,6 +3527,15 @@ async def run_admin_command_listener(
                         "projects",
                         "source",
                         "info",
+                        "testsource",
+                        "addrepo",
+                        "addsource",
+                        "pendingsources",
+                        "confirmsource",
+                        "rejectsource",
+                        "enablesource",
+                        "disablesource",
+                        "removesource",
                     }:
                         continue
 
@@ -3472,6 +3715,139 @@ async def run_admin_command_listener(
                             routing_state.get(source_ids, force_reload=True)
                             reload_requested.set()
                             await send_telegram_message(client, telegram_token, reply_chat_id, f"Admin <code>{html.escape(changed_user_id)}</code> {action}.")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "testsource":
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /testsource &lt;source_id&gt;")
+                            continue
+                        try:
+                            source_id = normalize_source_id(args[0])
+                            source = next((item for item in sources if item.get("id") == source_id), None)
+                            if source is None:
+                                raise ValueError(f"source '{source_id}' not found")
+                            entries = await validate_source_via_parser(client, source)
+                            await send_telegram_message_chunks(client, telegram_token, reply_chat_id, format_source_preview(source, entries))
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "addrepo":
+                        if not args:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                "Usage: /addrepo &lt;owner/repo|github_url&gt; [source_id] [product name...]",
+                            )
+                            continue
+                        try:
+                            source_id = args[1] if len(args) > 1 and re.fullmatch(r"[A-Za-z0-9_.:-]+", args[1]) else None
+                            product_start = 2 if source_id else 1
+                            product = " ".join(args[product_start:]).strip() or None
+                            source = build_github_release_source(args[0], source_id, product)
+                            entries = await validate_source_via_parser(client, source)
+                            preview = format_source_preview(source, entries)
+                            with db_connect(db_path) as conn:
+                                token = stage_pending_source_db(
+                                    conn,
+                                    source,
+                                    preview,
+                                    message,
+                                    action="upsert",
+                                )
+                            await send_telegram_message_chunks(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"{preview}\n\nStaged. Apply with <code>/confirmsource {html.escape(token)}</code>",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "addsource":
+                        try:
+                            parsed_source_args = parse_addsource_args(args)
+                            source = build_source_from_command(
+                                str(parsed_source_args["source_id"]),
+                                str(parsed_source_args["source_type"]),
+                                str(parsed_source_args["url"]),
+                                parsed_source_args["product"],
+                            )
+                            entries = await validate_source_via_parser(client, source)
+                            preview = format_source_preview(source, entries)
+                            with db_connect(db_path) as conn:
+                                token = stage_pending_source_db(conn, source, preview, message, action="upsert")
+                            await send_telegram_message_chunks(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"{preview}\n\nStaged. Apply with <code>/confirmsource {html.escape(token)}</code>",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "pendingsources":
+                        with db_connect(db_path) as conn:
+                            text = format_pending_sources_command(conn)
+                        await send_telegram_message_chunks(client, telegram_token, reply_chat_id, text)
+                        continue
+
+                    if command in {"confirmsource", "rejectsource"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;token&gt;")
+                            continue
+                        try:
+                            token = args[0]
+                            if command == "confirmsource":
+                                with db_connect(db_path) as conn:
+                                    pending = conn.execute("SELECT source_id, config_yaml FROM pending_sources WHERE token = ?", (token,)).fetchone()
+                                if pending is None:
+                                    raise ValueError(f"pending source token '{token}' not found")
+                                await validate_source_via_parser(
+                                    client,
+                                    parse_source_config_text(pending["source_id"], pending["config_yaml"]),
+                                )
+                            with db_connect(db_path) as conn:
+                                changed_source_id = apply_pending_source_db(conn, token) if command == "confirmsource" else reject_pending_source_db(conn, token)
+                            if command == "confirmsource":
+                                reload_requested.set()
+                                action = "applied"
+                            else:
+                                action = "rejected"
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Source <code>{html.escape(changed_source_id)}</code> {action}.",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command in {"enablesource", "disablesource", "removesource"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;source_id&gt;")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                if command == "removesource":
+                                    changed_source_id = remove_source_db(conn, args[0])
+                                    action = "removed"
+                                else:
+                                    changed_source_id = set_source_enabled_db(conn, args[0], command == "enablesource")
+                                    action = "enabled" if command == "enablesource" else "disabled"
+                            reload_requested.set()
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Source <code>{html.escape(changed_source_id)}</code> {action}.",
+                            )
                         except Exception as exc:
                             await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue

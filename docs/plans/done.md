@@ -63,4 +63,13 @@
 - Добавлены admin commands для approve/reject/add/remove/enable/disable chats, chat alias/title/delivery и add/remove admins.
 - Mutating commands пишут SQLite и запрашивают hot reload routing state где нужно.
 - `/removechat` удаляет routing row/subscriptions без ручного удаления history/runtime delivery tables.
-- Следующая итерация: Telegram source management with staging.
+
+## Iteration 5: Telegram Source Management With Staging
+
+- Добавлена SQLite-таблица `pending_sources` для staging-заявок на source changes; export/import settings её не включает.
+- Расширен существующий HTTP long-polling admin listener без новых dependencies/frameworks.
+- Добавлены admin commands `/testsource`, `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource`.
+- Validation перед staging использует существующий `parse_source` path и требует хотя бы одну entry.
+- Apply/toggle/remove пишут SQLite и запрашивают reload; `/removesource` блокируется при ссылках из source groups или direct chat subscriptions.
+- Telegram source commands не принимают provider/model/API keys.
+- Следующая итерация: subscription aliases and operational commands.

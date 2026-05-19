@@ -86,6 +86,7 @@ Windows PowerShell 7 + WSL:
 - `/requestchat [alias]`, `/addme [alias]` — создать pending-заявку на добавление текущего чата, доступно любому пользователю.
 - `/admins`, `/chats` (`/contacts`), `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`) — короткий просмотр runtime settings из SQLite, только для admins.
 - `/pending`, `/approvechat`, `/rejectchat`, `/addchat_here`, `/removechat`, `/enablechat`, `/disablechat`, `/addadmin`, `/removeadmin`, `/setchatalias`, `/setchattitle`, `/setchatdelivery` — admin chat/admin management в SQLite.
+- `/testsource`, `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource` — safe source management через staging/approval; source validation использует текущий parser/network path.
 - `/reload`, `/subscribe <source_id> [chat_id|alias]`, `/unsubscribe <source_id> [chat_id|alias]` — существующие admin write/reload команды.
 
 ## Документация

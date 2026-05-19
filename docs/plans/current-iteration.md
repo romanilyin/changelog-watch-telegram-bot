@@ -1,17 +1,16 @@
 # Current Iteration
 
-## Iteration 5: Telegram Source Management With Staging
+## Iteration 6: Subscription Aliases And Operational Commands
 
-Цель: добавить безопасное управление runtime source definitions из Telegram через staging/approval flow.
+Цель: упростить ежедневное управление подписками и эксплуатацией бота из Telegram.
 
 ## Scope
 
-- Staging-заявки на добавление/изменение runtime sources.
-- Просмотр diff/validation результата перед применением.
-- Apply/reject staged source changes из admin commands.
-- Сохранить SQLite как runtime source-of-truth.
+- Subscription aliases для частых наборов sources/chats.
+- Operational admin commands для безопасной диагностики состояния runtime.
+- Короткие ответы для health/status без ручного SSH.
 
 ## Out Of Scope
 
-- Изменение provider/model ключей и `ai-summary-models.local.yaml`.
-- Полный UI wizard вместо коротких Telegram commands.
+- Изменение provider/model ключей и `ai-summary-models.local.yaml` из Telegram.
+- Полноценный web UI.
