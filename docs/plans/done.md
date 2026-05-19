@@ -55,4 +55,12 @@
 - Добавлена команда `/id`, доступная любому пользователю для setup.
 - `/help` обновлен с read aliases и существующими `/reload`, `/subscribe`, `/unsubscribe`.
 - Telegram-ответы экранируют runtime/user values для HTML parse mode и режутся на короткие chunks.
-- Следующая итерация: Telegram admin/chat management.
+
+## Iteration 4: Telegram Admin/Chat Management
+
+- Добавлена SQLite-таблица `pending_chats` для заявок из `/requestchat` и `/addme` с chat/requester metadata.
+- Расширен существующий HTTP long-polling listener без новых Telegram dependencies.
+- Добавлены admin commands для approve/reject/add/remove/enable/disable chats, chat alias/title/delivery и add/remove admins.
+- Mutating commands пишут SQLite и запрашивают hot reload routing state где нужно.
+- `/removechat` удаляет routing row/subscriptions без ручного удаления history/runtime delivery tables.
+- Следующая итерация: Telegram source management with staging.

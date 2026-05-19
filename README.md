@@ -83,7 +83,9 @@ Windows PowerShell 7 + WSL:
 В continuous mode доступны runtime-команды:
 
 - `/id` — показать текущие `user_id` и `chat_id`, доступно любому пользователю.
+- `/requestchat [alias]`, `/addme [alias]` — создать pending-заявку на добавление текущего чата, доступно любому пользователю.
 - `/admins`, `/chats` (`/contacts`), `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`) — короткий просмотр runtime settings из SQLite, только для admins.
+- `/pending`, `/approvechat`, `/rejectchat`, `/addchat_here`, `/removechat`, `/enablechat`, `/disablechat`, `/addadmin`, `/removeadmin`, `/setchatalias`, `/setchattitle`, `/setchatdelivery` — admin chat/admin management в SQLite.
 - `/reload`, `/subscribe <source_id> [chat_id|alias]`, `/unsubscribe <source_id> [chat_id|alias]` — существующие admin write/reload команды.
 
 ## Документация

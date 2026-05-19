@@ -565,6 +565,10 @@ def html_escape_value(value: Any) -> str:
     return html.escape(text if text else "-")
 
 
+def html_escape_error(exc: BaseException) -> str:
+    return html.escape(mask_telegram_bot_token(str(exc)))
+
+
 def bool_status(value: bool) -> str:
     return "on" if value else "off"
 
@@ -600,6 +604,34 @@ def format_chats_command(routing: RoutingConfig) -> str:
             f"<code>{html.escape(chat.chat_id)}</code>{alias}{title} "
             f"enabled={bool_status(chat.enabled)} mode={html.escape(chat.delivery_mode)} "
             f"groups={len(chat.groups)} sources={len(chat.source_ids)}"
+        )
+    return "\n".join(lines)
+
+
+def format_pending_chats_command(conn: sqlite3.Connection) -> str:
+    rows = conn.execute(
+        """
+        SELECT chat_id, title, username, type, requested_by_user_id, requested_by_name, requested_alias, created_at
+        FROM pending_chats
+        ORDER BY created_at, chat_id
+        """
+    ).fetchall()
+    lines = ["<b>Pending chats</b>"]
+    if not rows:
+        lines.append("No pending chats.")
+        return "\n".join(lines)
+
+    for row in rows:
+        alias = normalize_alias(row["requested_alias"])
+        alias_arg = f" {html.escape(alias)}" if alias else ""
+        username = f" @{html_escape_value(row['username'])}" if row["username"] else ""
+        title = html_escape_value(row["title"])
+        requester = html_escape_value(row["requested_by_name"] or row["requested_by_user_id"])
+        lines.append(
+            f"<code>{html.escape(row['chat_id'])}</code>{username} {title} "
+            f"type={html_escape_value(row['type'])} by={requester}\n"
+            f"<code>/approvechat {html.escape(row['chat_id'])}{alias_arg}</code>\n"
+            f"<code>/rejectchat {html.escape(row['chat_id'])}</code>"
         )
     return "\n".join(lines)
 
@@ -666,11 +698,23 @@ def format_help_command() -> str:
         [
             "<b>Commands</b>",
             "/id",
+            "/requestchat [alias]",
+            "/addme [alias]",
             "/admins",
             "/chats or /contacts",
+            "/pending",
             "/sources or /projects",
             "/source &lt;source_id&gt; or /info &lt;source_id&gt;",
             "/reload",
+            "/approvechat &lt;chat_id&gt; [alias]",
+            "/rejectchat &lt;chat_id&gt;",
+            "/addchat_here [alias]",
+            "/removechat &lt;chat_id|alias&gt;",
+            "/enablechat &lt;chat_id|alias&gt; /disablechat &lt;chat_id|alias&gt;",
+            "/addadmin &lt;user_id&gt; [alias] /removeadmin &lt;user_id|alias&gt;",
+            "/setchatalias &lt;chat_id|alias&gt; &lt;alias|-&gt;",
+            "/setchattitle &lt;chat_id|alias&gt; &lt;title|-&gt;",
+            "/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;",
             "/subscribe &lt;source_id&gt; [chat_id|alias]",
             "/unsubscribe &lt;source_id&gt; [chat_id|alias]",
         ]
@@ -1004,6 +1048,207 @@ def apply_chat_subscription_change_db(
 def apply_chat_subscription_change(db_path: str | Path, source_id: str, chat_id: str, *, add: bool, chat_title: str | None = None) -> str:
     with db_connect(db_path) as conn:
         return apply_chat_subscription_change_db(conn, source_id, chat_id, add=add, chat_title=chat_title)
+
+
+def requested_by_name(user: dict[str, Any]) -> str | None:
+    parts = [normalize_string(user.get("first_name")), normalize_string(user.get("last_name"))]
+    full_name = " ".join(part for part in parts if part)
+    username = normalize_string(user.get("username"))
+    if username:
+        return f"{full_name} (@{username})" if full_name else f"@{username}"
+    return full_name or None
+
+
+def chat_title_from_message(message: dict[str, Any]) -> str | None:
+    chat = message.get("chat") or {}
+    return normalize_string(chat.get("title") or chat.get("first_name") or chat.get("username")) or None
+
+
+def upsert_pending_chat_db(conn: sqlite3.Connection, message: dict[str, Any], alias: str | None) -> str:
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+    chat_id = normalize_chat_id(chat.get("id"), "chat.id")
+    user_id = normalize_chat_id(user.get("id"), "from.id") if user.get("id") is not None else None
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO pending_chats(
+            chat_id, title, username, type, requested_by_user_id, requested_by_name, requested_alias, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title = excluded.title,
+            username = excluded.username,
+            type = excluded.type,
+            requested_by_user_id = excluded.requested_by_user_id,
+            requested_by_name = excluded.requested_by_name,
+            requested_alias = excluded.requested_alias,
+            created_at = excluded.created_at
+        """,
+        (
+            chat_id,
+            chat_title_from_message(message),
+            normalize_string(chat.get("username")) or None,
+            normalize_string(chat.get("type")) or None,
+            user_id,
+            requested_by_name(user),
+            alias,
+            now,
+        ),
+    )
+    conn.commit()
+    return chat_id
+
+
+def resolve_admin_identifier_db(conn: sqlite3.Connection, value: str) -> str | None:
+    normalized = normalize_string(value)
+    if not normalized:
+        return None
+    alias = normalize_alias(normalized)
+    if alias:
+        row = conn.execute("SELECT user_id FROM routing_admins WHERE lower(alias) = ?", (alias,)).fetchone()
+        if row:
+            return normalize_chat_id(row["user_id"], "admin alias")
+    try:
+        return normalize_chat_id(normalized, "admin identifier")
+    except ValueError:
+        return None
+
+
+def add_admin_db(conn: sqlite3.Connection, user_id: str, alias: str | None) -> str:
+    normalized_user_id = normalize_chat_id(user_id, "user_id")
+    if alias:
+        existing = conn.execute(
+            "SELECT user_id FROM routing_admins WHERE lower(alias) = ? AND user_id != ?",
+            (alias, normalized_user_id),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"admin alias '{alias}' is already used")
+    conn.execute(
+        """
+        INSERT INTO routing_admins(user_id, alias) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET alias = COALESCE(excluded.alias, routing_admins.alias)
+        """,
+        (normalized_user_id, alias),
+    )
+    conn.commit()
+    return normalized_user_id
+
+
+def remove_admin_db(conn: sqlite3.Connection, identifier: str) -> str:
+    user_id = resolve_admin_identifier_db(conn, identifier)
+    if user_id is None:
+        raise ValueError(f"admin '{identifier}' not found")
+    admin_count = conn.execute("SELECT COUNT(*) FROM routing_admins").fetchone()[0]
+    if admin_count <= 1:
+        raise ValueError("cannot remove the last admin")
+    cursor = conn.execute("DELETE FROM routing_admins WHERE user_id = ?", (user_id,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise ValueError(f"admin '{identifier}' not found")
+    return user_id
+
+
+def upsert_chat_db(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    *,
+    alias: str | None = None,
+    title: str | None = None,
+    enabled: bool = True,
+    delivery_mode: str = "instant",
+) -> str:
+    normalized_chat_id = normalize_chat_id(chat_id, "chat_id")
+    if alias:
+        existing = conn.execute(
+            "SELECT chat_id FROM routing_chats WHERE lower(alias) = ? AND chat_id != ?",
+            (alias, normalized_chat_id),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"chat alias '{alias}' is already used")
+    delivery_mode = parse_delivery_mode(delivery_mode, f"chat {normalized_chat_id}", send_summary=True)
+    send_summary = delivery_mode in {"digest", "both"}
+    conn.execute(
+        """
+        INSERT INTO routing_chats(
+            chat_id, title, enabled, send_summary, delivery_mode, alias, summary_mode, summary_on_startup
+        ) VALUES (?, ?, ?, ?, ?, ?, 'none', 0)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title = COALESCE(excluded.title, routing_chats.title),
+            enabled = excluded.enabled,
+            send_summary = routing_chats.send_summary,
+            delivery_mode = routing_chats.delivery_mode,
+            alias = COALESCE(excluded.alias, routing_chats.alias)
+        """,
+        (normalized_chat_id, title, int(enabled), int(send_summary), delivery_mode, alias),
+    )
+    return normalized_chat_id
+
+
+def remove_chat_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    foreign_keys_enabled = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.commit()
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM routing_chat_sources WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM routing_chat_groups WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM routing_chats WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
+    return chat_id
+
+
+def set_chat_enabled_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig, enabled: bool) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    conn.execute("UPDATE routing_chats SET enabled = ? WHERE chat_id = ?", (int(enabled), chat_id))
+    conn.commit()
+    return chat_id
+
+
+def set_chat_alias_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig, alias: str | None) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    if alias:
+        existing = conn.execute(
+            "SELECT chat_id FROM routing_chats WHERE lower(alias) = ? AND chat_id != ?",
+            (alias, chat_id),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"chat alias '{alias}' is already used")
+    conn.execute("UPDATE routing_chats SET alias = ? WHERE chat_id = ?", (alias, chat_id))
+    conn.commit()
+    return chat_id
+
+
+def set_chat_title_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig, title: str | None) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    conn.execute("UPDATE routing_chats SET title = ? WHERE chat_id = ?", (title, chat_id))
+    conn.commit()
+    return chat_id
+
+
+def set_chat_delivery_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig, delivery_mode: str) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    mode = parse_delivery_mode(delivery_mode, f"chat {chat_id}", send_summary=True)
+    conn.execute(
+        "UPDATE routing_chats SET delivery_mode = ?, send_summary = ? WHERE chat_id = ?",
+        (mode, int(mode in {"digest", "both"}), chat_id),
+    )
+    conn.commit()
+    return chat_id
 
 
 def setup_logging() -> None:
@@ -1667,6 +1912,22 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_queue_chat_id ON summary_queue(chat_id)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_chats (
+            chat_id TEXT PRIMARY KEY,
+            title TEXT,
+            username TEXT,
+            type TEXT,
+            requested_by_user_id TEXT,
+            requested_by_name TEXT,
+            requested_alias TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_chats_created_at ON pending_chats(created_at)")
 
 
 def initialize_database_schema(conn: sqlite3.Connection) -> None:
@@ -2915,6 +3176,25 @@ async def validate_chat_access(
     return ChatAccessResult(chat_id=chat_id, accessible=can_send, reason=reason)
 
 
+async def try_validate_chat_for_admin_command(
+    client: httpx.AsyncClient,
+    token: str,
+    chat_id: str,
+    *,
+    allow_current_reply_chat: bool,
+) -> tuple[bool, str | None]:
+    try:
+        bot_user_id = await get_bot_user_id(client, token)
+        result = await validate_chat_access(client, token, bot_user_id, chat_id)
+    except Exception as exc:
+        if allow_current_reply_chat:
+            return True, f"Telegram validation skipped after API error: {html_escape_error(exc)}"
+        return False, f"Telegram validation failed; chat was not added: {html_escape_error(exc)}"
+    if not result.accessible:
+        return False, f"Telegram validation failed; chat was not added: {html_escape_value(result.reason)}"
+    return True, None
+
+
 async def validate_routing_chats(
     client: httpx.AsyncClient,
     token: str,
@@ -2992,9 +3272,23 @@ async def run_admin_command_listener(
                         "start",
                         "help",
                         "id",
+                        "requestchat",
+                        "addme",
                         "admins",
                         "chats",
                         "contacts",
+                        "pending",
+                        "approvechat",
+                        "rejectchat",
+                        "addchat_here",
+                        "removechat",
+                        "enablechat",
+                        "disablechat",
+                        "addadmin",
+                        "removeadmin",
+                        "setchatalias",
+                        "setchattitle",
+                        "setchatdelivery",
                         "sources",
                         "projects",
                         "source",
@@ -3010,6 +3304,25 @@ async def run_admin_command_listener(
 
                     if command == "id":
                         await send_telegram_message(client, telegram_token, reply_chat_id, format_id_command(message))
+                        continue
+
+                    if command in {"requestchat", "addme"}:
+                        if command == "addme" and normalize_string(message.get("chat", {}).get("type")) != "private":
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Use /addme only in a private chat.")
+                            continue
+                        try:
+                            alias = normalize_alias(args[0]) if args else None
+                            with db_connect(db_path) as conn:
+                                pending_chat_id = upsert_pending_chat_db(conn, message, alias)
+                            alias_text = f" alias=<code>{html.escape(alias)}</code>" if alias else ""
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Request saved for chat <code>{html.escape(pending_chat_id)}</code>{alias_text}.",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
                     with db_connect(db_path) as conn:
@@ -3029,6 +3342,138 @@ async def run_admin_command_listener(
                             reply_chat_id,
                             "🔄 Routing config перезагружен.",
                         )
+                        continue
+
+                    if command == "pending":
+                        with db_connect(db_path) as conn:
+                            text = format_pending_chats_command(conn)
+                        await send_telegram_message_chunks(client, telegram_token, reply_chat_id, text)
+                        continue
+
+                    if command == "approvechat":
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /approvechat &lt;chat_id&gt; [alias]")
+                            continue
+                        try:
+                            target_chat_id = normalize_chat_id(args[0], "chat_id")
+                            alias = normalize_alias(args[1]) if len(args) > 1 else None
+                            with db_connect(db_path) as conn:
+                                pending = conn.execute("SELECT * FROM pending_chats WHERE chat_id = ?", (target_chat_id,)).fetchone()
+                                if pending is not None and alias is None:
+                                    alias = normalize_alias(pending["requested_alias"])
+                                title = normalize_string(pending["title"]) if pending is not None else None
+                            allowed, note = await try_validate_chat_for_admin_command(
+                                client,
+                                telegram_token,
+                                target_chat_id,
+                                allow_current_reply_chat=target_chat_id == reply_chat_id,
+                            )
+                            if not allowed:
+                                await send_telegram_message(client, telegram_token, reply_chat_id, note or "Telegram validation failed.")
+                                continue
+                            with db_connect(db_path) as conn:
+                                upsert_chat_db(conn, target_chat_id, alias=alias, title=title, enabled=True)
+                                conn.execute("DELETE FROM pending_chats WHERE chat_id = ?", (target_chat_id,))
+                                conn.commit()
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            suffix = f" {note}" if note else ""
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(target_chat_id)}</code> approved.{suffix}")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "rejectchat":
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /rejectchat &lt;chat_id&gt;")
+                            continue
+                        try:
+                            target_chat_id = normalize_chat_id(args[0], "chat_id")
+                            with db_connect(db_path) as conn:
+                                cursor = conn.execute("DELETE FROM pending_chats WHERE chat_id = ?", (target_chat_id,))
+                                conn.commit()
+                            status = "rejected" if cursor.rowcount else "not found"
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Pending chat <code>{html.escape(target_chat_id)}</code> {status}.")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command == "addchat_here":
+                        try:
+                            alias = normalize_alias(args[0]) if args else None
+                            allowed, note = await try_validate_chat_for_admin_command(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                allow_current_reply_chat=True,
+                            )
+                            if not allowed:
+                                await send_telegram_message(client, telegram_token, reply_chat_id, note or "Telegram validation failed.")
+                                continue
+                            with db_connect(db_path) as conn:
+                                upsert_chat_db(conn, reply_chat_id, alias=alias, title=chat_title_from_message(message), enabled=True)
+                                conn.execute("DELETE FROM pending_chats WHERE chat_id = ?", (reply_chat_id,))
+                                conn.commit()
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            suffix = f" {note}" if note else ""
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(reply_chat_id)}</code> added.{suffix}")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command in {"removechat", "enablechat", "disablechat", "setchatalias", "setchattitle", "setchatdelivery"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;chat_id|alias&gt; ...")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                if command == "removechat":
+                                    changed_chat_id = remove_chat_db(conn, args[0], routing)
+                                    action = "removed"
+                                elif command in {"enablechat", "disablechat"}:
+                                    changed_chat_id = set_chat_enabled_db(conn, args[0], routing, command == "enablechat")
+                                    action = "enabled" if command == "enablechat" else "disabled"
+                                elif command == "setchatalias":
+                                    if len(args) < 2:
+                                        raise ValueError("Usage: /setchatalias <chat_id|alias> <alias|->")
+                                    changed_chat_id = set_chat_alias_db(conn, args[0], routing, None if args[1] == "-" else normalize_alias(args[1]))
+                                    action = "alias updated"
+                                elif command == "setchattitle":
+                                    if len(args) < 2:
+                                        raise ValueError("Usage: /setchattitle <chat_id|alias> <title|->")
+                                    title = None if args[1] == "-" else " ".join(args[1:]).strip()
+                                    changed_chat_id = set_chat_title_db(conn, args[0], routing, title)
+                                    action = "title updated"
+                                else:
+                                    if len(args) < 2:
+                                        raise ValueError("Usage: /setchatdelivery <chat_id|alias> <instant|digest|both|none>")
+                                    changed_chat_id = set_chat_delivery_db(conn, args[0], routing, args[1])
+                                    action = "delivery updated"
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(changed_chat_id)}</code> {html.escape(action)}.")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command in {"addadmin", "removeadmin"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;user_id|alias&gt; [alias]")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                if command == "addadmin":
+                                    changed_user_id = add_admin_db(conn, args[0], normalize_alias(args[1]) if len(args) > 1 else None)
+                                    action = "added"
+                                else:
+                                    changed_user_id = remove_admin_db(conn, args[0])
+                                    action = "removed"
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Admin <code>{html.escape(changed_user_id)}</code> {action}.")
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
                     if command in {"subscribe", "unsubscribe"}:

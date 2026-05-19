@@ -320,10 +320,15 @@ Dry-run:
 - `/chats` или `/contacts` — список чатов: id, alias/title, enabled, delivery mode, counts groups/sources.
 - `/sources` или `/projects` — список runtime sources из SQLite: id, product, type, enabled.
 - `/source <source_id>` или `/info <source_id>` — детали source и подписанные чаты/группы.
+- `/pending` — pending-заявки с copyable `/approvechat` и `/rejectchat`.
+- `/approvechat <chat_id> [alias]`, `/rejectchat <chat_id>`, `/addchat_here [alias]` — добавить или отклонить чат после Telegram access validation где возможно.
+- `/removechat <chat_id|alias>`, `/enablechat <chat_id|alias>`, `/disablechat <chat_id|alias>` — удалить routing row или переключить enabled без удаления history tables.
+- `/addadmin <user_id> [alias]`, `/removeadmin <user_id|alias>` — управление админами; последний admin защищён от удаления.
+- `/setchatalias <chat_id|alias> <alias|->`, `/setchattitle <chat_id|alias> <title|->`, `/setchatdelivery <chat_id|alias> <instant|digest|both|none>` — runtime-настройки чата.
 - `/reload` — перечитать routing state.
 - `/subscribe <source_id> [chat_id|alias]` — добавить источник в чат.
 - `/unsubscribe <source_id> [chat_id|alias]` — убрать источник из чата.
 
-Команда `/id` показывает текущие `user_id` и `chat_id` и доступна любому пользователю для первичной настройки.
+Команды `/id`, `/requestchat [alias]` и `/addme [alias]` доступны любому пользователю. `/addme` работает только в private chat. Pending-заявки сохраняются в SQLite с chat metadata и не раскрывают `.env`/secrets.
 
 Изменения пишутся в SQLite и сохраняются при рестарте. Они не перетираются seed-файлом в `ROUTING_SEED_MODE=once`.

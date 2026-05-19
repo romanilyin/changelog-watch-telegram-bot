@@ -1,17 +1,17 @@
 # Current Iteration
 
-## Iteration 4: Telegram Admin/Chat Management
+## Iteration 5: Telegram Source Management With Staging
 
-Цель: добавить Telegram-команды управления admins/chats поверх SQLite runtime settings.
+Цель: добавить безопасное управление runtime source definitions из Telegram через staging/approval flow.
 
 ## Scope
 
-- Pending-flow для добавления admin/chat из Telegram.
-- Включение/отключение чатов из Telegram.
-- Управление alias/title/delivery mode для chats.
+- Staging-заявки на добавление/изменение runtime sources.
+- Просмотр diff/validation результата перед применением.
+- Apply/reject staged source changes из admin commands.
 - Сохранить SQLite как runtime source-of-truth.
 
 ## Out Of Scope
 
-- Изменение source definitions из Telegram.
 - Изменение provider/model ключей и `ai-summary-models.local.yaml`.
+- Полный UI wizard вместо коротких Telegram commands.
