@@ -855,40 +855,81 @@ def format_id_command(message: dict[str, Any]) -> str:
     return f"user_id=<code>{user_id}</code>\nchat_id=<code>{chat_id}</code>"
 
 
-def format_help_command() -> str:
-    return "\n".join(
+def format_help_command(is_admin: bool) -> str:
+    lines = [
+        "<b>Справка по командам</b>",
+        "🔸 доступно всем",
+    ]
+    if is_admin:
+        lines.append("🔹 только админам")
+
+    lines.extend(
         [
-            "<b>Commands</b>",
-            "/id",
-            "/requestchat [alias]",
-            "/addme [alias]",
-            "/admins",
-            "/chats or /contacts",
-            "/pending",
-            "/sources or /projects",
-            "/source &lt;source_id&gt; or /info &lt;source_id&gt;",
-            "/testsource &lt;source_id&gt;",
-            "/addrepo &lt;owner/repo|github_url&gt; [source_id] [product name...]",
-            "/addsource &lt;source_id&gt; &lt;type&gt; &lt;url&gt; | &lt;product name&gt;",
-            "/pendingsources /confirmsource &lt;token&gt; /rejectsource &lt;token&gt;",
-            "/enablesource &lt;source_id&gt; /disablesource &lt;source_id&gt; /removesource &lt;source_id&gt;",
-            "/reload",
-            "/status",
-            "/approvechat &lt;chat_id&gt; [alias]",
-            "/rejectchat &lt;chat_id&gt;",
-            "/addchat_here [alias]",
-            "/removechat &lt;chat_id|alias&gt;",
-            "/enablechat &lt;chat_id|alias&gt; /disablechat &lt;chat_id|alias&gt;",
-            "/addadmin &lt;user_id&gt; [alias] /removeadmin &lt;user_id|alias&gt;",
-            "/setchatalias &lt;chat_id|alias&gt; &lt;alias|-&gt;",
-            "/setchattitle &lt;chat_id|alias&gt; &lt;title|-&gt;",
-            "/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;",
-            "/subscribe &lt;source_id&gt; [chat_id|alias] /link &lt;source_id&gt; &lt;chat_id|alias&gt;",
-            "/unsubscribe &lt;source_id&gt; [chat_id|alias] /unlink &lt;source_id&gt; &lt;chat_id|alias&gt;",
-            "/subscribe_here &lt;source_id&gt; /unsubscribe_here &lt;source_id&gt;",
-            "/subscriptions [chat_id|alias]",
+            "",
+            "<b>Общие</b>",
+            "🔸<code>/help</code> - показать эту справку.",
+            "🔸<code>/start</code> - открыть справку.",
+            "🔸<code>/id</code> - показать твои user_id и chat_id.",
+            "🔸<code>/requestchat [alias]</code> - создать заявку на добавление текущего чата.",
+            "🔸<code>/addme [alias]</code> - создать заявку из личного чата с ботом.",
         ]
     )
+
+    if not is_admin:
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "",
+            "<b>Просмотр</b>",
+            "🔹<code>/status</code> - показать состояние бота, источников, чатов и БД.",
+            "🔹<code>/admins</code> - показать список админов.",
+            "🔹<code>/chats</code> - показать подключённые чаты.",
+            "🔹<code>/contacts</code> - то же, что /chats.",
+            "🔹<code>/sources</code> - показать источники changelog/release.",
+            "🔹<code>/projects</code> - то же, что /sources.",
+            "🔹<code>/source &lt;source_id&gt;</code> - показать детали источника.",
+            "🔹<code>/info &lt;source_id&gt;</code> - то же, что /source.",
+            "🔹<code>/subscriptions [chat_id|alias]</code> - показать подписки чата.",
+            "",
+            "<b>Чаты</b>",
+            "🔹<code>/pending</code> - показать заявки на добавление чатов.",
+            "🔹<code>/approvechat &lt;chat_id&gt; [alias]</code> - подтвердить заявку чата.",
+            "🔹<code>/rejectchat &lt;chat_id&gt;</code> - отклонить заявку чата.",
+            "🔹<code>/addchat_here [alias]</code> - добавить текущий чат сразу.",
+            "🔹<code>/removechat &lt;chat_id|alias&gt;</code> - удалить чат из роутинга.",
+            "🔹<code>/enablechat &lt;chat_id|alias&gt;</code> - включить отправку в чат.",
+            "🔹<code>/disablechat &lt;chat_id|alias&gt;</code> - выключить отправку в чат.",
+            "🔹<code>/setchatalias &lt;chat_id|alias&gt; &lt;alias|-&gt;</code> - задать или сбросить alias чата.",
+            "🔹<code>/setchattitle &lt;chat_id|alias&gt; &lt;title|-&gt;</code> - задать или сбросить название чата.",
+            "🔹<code>/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;</code> - настроить режим доставки.",
+            "",
+            "<b>Источники</b>",
+            "🔹<code>/testsource &lt;source_id&gt;</code> - проверить парсинг источника и показать preview.",
+            "🔹<code>/addrepo &lt;owner/repo|github_url&gt; [source_id] [product name...]</code> - добавить GitHub Releases источник через preview.",
+            "🔹<code>/addsource &lt;source_id&gt; &lt;type&gt; &lt;url&gt; | &lt;product name&gt;</code> - добавить источник вручную через preview.",
+            "🔹<code>/pendingsources</code> - показать источники, ожидающие подтверждения.",
+            "🔹<code>/confirmsource &lt;token&gt;</code> - применить ожидающий источник.",
+            "🔹<code>/rejectsource &lt;token&gt;</code> - отклонить ожидающий источник.",
+            "🔹<code>/enablesource &lt;source_id&gt;</code> - включить источник.",
+            "🔹<code>/disablesource &lt;source_id&gt;</code> - выключить источник.",
+            "🔹<code>/removesource &lt;source_id&gt;</code> - удалить источник.",
+            "",
+            "<b>Подписки</b>",
+            "🔹<code>/subscribe &lt;source_id&gt; [chat_id|alias]</code> - подписать чат на источник.",
+            "🔹<code>/unsubscribe &lt;source_id&gt; [chat_id|alias]</code> - отписать чат от источника.",
+            "🔹<code>/link &lt;source_id&gt; &lt;chat_id|alias&gt;</code> - то же, что /subscribe, но чат обязателен.",
+            "🔹<code>/unlink &lt;source_id&gt; &lt;chat_id|alias&gt;</code> - то же, что /unsubscribe, но чат обязателен.",
+            "🔹<code>/subscribe_here &lt;source_id&gt;</code> - подписать текущий чат.",
+            "🔹<code>/unsubscribe_here &lt;source_id&gt;</code> - отписать текущий чат.",
+            "",
+            "<b>Админы и обслуживание</b>",
+            "🔹<code>/addadmin &lt;user_id&gt; [alias]</code> - добавить админа.",
+            "🔹<code>/removeadmin &lt;user_id|alias&gt;</code> - удалить админа.",
+            "🔹<code>/reload</code> - перечитать routing config и применить изменения.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def self_test_admin_helpers() -> None:
@@ -4384,7 +4425,18 @@ async def run_admin_command_listener(
                         poll_minutes = int(runtime_config.get("poll_minutes", 30))
                     source_ids = collect_source_ids(sources)
                     routing = routing_state.get(source_ids)
-                    if not is_authorized_admin(routing.admins, (message.get("from") or {}).get("id")):
+                    is_admin = is_authorized_admin(routing.admins, (message.get("from") or {}).get("id"))
+
+                    if command in {"start", "help"}:
+                        await send_telegram_message(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_help_command(is_admin),
+                        )
+                        continue
+
+                    if not is_admin:
                         continue
 
                     if command == "reload":
@@ -4788,15 +4840,6 @@ async def run_admin_command_listener(
                             telegram_token,
                             reply_chat_id,
                             format_source_details_command(normalize_source_id(args[0]), sources, routing),
-                        )
-                        continue
-
-                    if command in {"start", "help"}:
-                        await send_telegram_message(
-                            client,
-                            telegram_token,
-                            reply_chat_id,
-                            format_help_command(),
                         )
                         continue
 
