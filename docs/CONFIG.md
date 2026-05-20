@@ -84,6 +84,9 @@ chats:
   - chat_id: -1001234567890
     alias: main
     title: Основной канал
+    chat_admins:
+      - id: 23456789
+        alias: editor
     groups:
       - all
     sources: []
@@ -99,6 +102,7 @@ chats:
 
 - `chat_id` — Telegram chat/channel ID.
 - `alias` — короткое имя для admin commands.
+- `chat_admins` — пользователи, которые могут добавлять публичные источники и управлять подписками только этого чата.
 - `groups` — группы источников из `source_groups`.
 - `sources` — дополнительные конкретные source ids.
 - `enabled` — отключает чат без удаления.
@@ -227,7 +231,9 @@ sources:
 
 `source.id` — ключ дедупликации в SQLite. Если изменить id, старые entries будут выглядеть как новые.
 
-Telegram admins могут управлять runtime sources через staging flow: `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource`. Перед staging бот вызывает обычный `parse_source` path и требует хотя бы одну найденную entry; provider/model/API keys через Telegram не настраиваются.
+`private: true` скрывает источник от chat admins: его видят и редактируют только full admins. Доставка в уже подписанные чаты при этом не отключается.
+
+Telegram admins могут управлять runtime sources через staging flow: `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/setsourceprivate`, `/removesource`. Chat admins могут добавлять только новые публичные sources и не могут перезаписывать существующие. Перед staging бот вызывает обычный `parse_source` path и требует хотя бы одну найденную entry; provider/model/API keys через Telegram не настраиваются.
 
 Subscription commands: `/subscribe` (`/link`), `/unsubscribe` (`/unlink`), `/subscribe_here`, `/unsubscribe_here`, `/subscriptions [chat_id|alias]`. Operational status: `/status` shows safe counts, `poll_minutes`, and a non-secret DB path label.
 
@@ -302,7 +308,7 @@ python bot.py --import-settings data/settings-backup.yaml --replace
 python bot.py --import-settings data/settings-backup.yaml --replace --db data/restored.sqlite3
 ```
 
-Экспорт включает только routing/settings tables: admins, source groups, chats и подписки. Runtime/history таблицы `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state` не экспортируются и не удаляются при restore.
+Экспорт включает только routing/settings tables: admins, chat admins, source groups, chats и подписки. Runtime/history таблицы `posted_items`, `deliveries`, `summary_queue`, `ai_summaries`, `source_state` не экспортируются и не удаляются при restore.
 
 ## Dry-Run
 
@@ -331,13 +337,18 @@ Dry-run:
 
 - `/admins` — список admin ids и aliases из SQLite.
 - `/chats` или `/contacts` — список чатов: id, alias/title, enabled, delivery mode, counts groups/sources.
+- `/routing [chat_id|alias]` — обзор что, куда и когда отправляется; с аргументом показывает детали одного чата и copyable команды настройки.
+- `/deliveries [chat_id|alias]` — матрица direct sources и source channels по чатам.
+- `/schedule [chat_id|alias]` — digest-расписание чатов и copyable команды настройки.
+- `/chatadmins [chat_id|alias]`, `/addchatadmin <chat_id|alias> <user_id> [alias]`, `/removechatadmin <chat_id|alias> <user_id|alias>` — управление chat admins.
+- `/channels`, `/channel <channel>`, `/addchannel <channel>`, `/removechannel <channel>`, `/channel_addsource <channel> <source_id>`, `/channel_removesource <channel> <source_id>` — управление source groups как каналами источников.
 - `/sources` или `/projects` — список runtime sources из SQLite: id, product, type, enabled.
 - `/source <source_id>` или `/info <source_id>` — детали source и подписанные чаты/группы.
 - `/pending` — pending-заявки с copyable `/approvechat` и `/rejectchat`.
 - `/approvechat <chat_id> [alias]`, `/rejectchat <chat_id>`, `/addchat_here [alias]` — добавить или отклонить чат после Telegram access validation где возможно.
-- `/removechat <chat_id|alias>`, `/enablechat <chat_id|alias>`, `/disablechat <chat_id|alias>` — удалить routing row или переключить enabled без удаления history tables.
+- `/removechat <chat_id|alias>`, `/enablechat <chat_id|alias>`, `/disablechat <chat_id|alias>`, `/setchatenabled <chat_id|alias> <on|off>` — удалить routing row или переключить enabled без удаления history tables.
 - `/addadmin <user_id> [alias]`, `/removeadmin <user_id|alias>` — управление админами; последний admin защищён от удаления.
-- `/setchatalias <chat_id|alias> <alias|->`, `/setchattitle <chat_id|alias> <title|->`, `/setchatdelivery <chat_id|alias> <instant|digest|both|none>` — runtime-настройки чата.
+- `/setchatalias <chat_id|alias> <alias|->`, `/setchattitle <chat_id|alias> <title|->`, `/setchatdelivery <chat_id|alias> <instant|digest|both|none>`, `/setchatschedule <chat_id|alias> <none|immediate|daily|weekly> [time] [weekday]`, `/setstartupsummary <chat_id|alias> <on|off>` — runtime-настройки чата.
 - `/reload` — перечитать routing state.
 - `/status` — безопасный runtime status без секретов: counts, pending counts, `poll_minutes`, короткая DB path метка.
 - `/subscriptions [chat_id|alias]` — explicit и group-derived подписки выбранного или текущего чата.
@@ -345,6 +356,9 @@ Dry-run:
 - `/unsubscribe <source_id> [chat_id|alias]` — убрать источник из чата.
 - `/link <source_id> <chat_id|alias>`, `/unlink <source_id> <chat_id|alias>` — aliases для `/subscribe` и `/unsubscribe` в стиле старого GitLab bot UX.
 - `/subscribe_here <source_id>`, `/unsubscribe_here <source_id>` — изменить подписку текущего чата.
+- `/channel_subscribe <channel> [chat_id|alias]`, `/channel_unsubscribe <channel> [chat_id|alias]`, `/channel_subscribe_here <channel>`, `/channel_unsubscribe_here <channel>` — подписки чатов на каналы источников.
+
+Chat admins видят только свои чаты через `/mychats`, `/routing`, `/deliveries`, `/schedule`, публичные sources и свои pending source changes. Они могут менять `enabled`, `delivery_mode`, `summary_schedule`, `summary_on_startup` и подписки только своих чатов, но не могут управлять full admins, чужими чатами, private sources или существующими source ids.
 
 Команды `/id`, `/requestchat [alias]` и `/addme [alias]` доступны любому пользователю. `/addme` работает только в private chat. Pending-заявки сохраняются в SQLite с chat metadata и не раскрывают `.env`/secrets.
 
@@ -379,4 +393,4 @@ python bot.py --import-settings data/settings-backup.yaml --replace --db data/re
 
 6. Subscribe: admin связывает источник и чат через `/subscribe <source_id> [chat_id|alias]`, `/link <source_id> <chat_id|alias>` или `/subscribe_here <source_id>`; убрать подписку можно через `/unsubscribe`, `/unlink` или `/unsubscribe_here`.
 
-7. Check status: используй `/status` для safe counts, `/subscriptions [chat_id|alias]` для подписок, `/chats` для чатов, `/sources` для источников и `/source <source_id>` для деталей.
+7. Check status: используй `/status` для safe counts, `/routing [chat_id|alias]`, `/deliveries [chat_id|alias]`, `/schedule [chat_id|alias]`, `/subscriptions [chat_id|alias]` для подписок, `/chats` для чатов, `/sources` для источников и `/source <source_id>` для деталей.

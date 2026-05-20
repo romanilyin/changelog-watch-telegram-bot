@@ -87,11 +87,13 @@ Windows PowerShell 7 + WSL:
 
 - `/id` — показать текущие `user_id` и `chat_id`, доступно любому пользователю.
 - `/requestchat [alias]`, `/addme [alias]` — создать pending-заявку на добавление текущего чата, доступно любому пользователю.
-- `/admins`, `/chats` (`/contacts`), `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`) — короткий просмотр runtime settings из SQLite, только для admins.
-- `/pending`, `/approvechat`, `/rejectchat`, `/addchat_here`, `/removechat`, `/enablechat`, `/disablechat`, `/addadmin`, `/removeadmin`, `/setchatalias`, `/setchattitle`, `/setchatdelivery` — admin chat/admin management в SQLite.
-- `/testsource`, `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/removesource` — safe source management через staging/approval; source validation использует текущий parser/network path.
+- `/admins`, `/chats` (`/contacts`), `/routing [chat_id|alias]`, `/deliveries [chat_id|alias]`, `/schedule [chat_id|alias]`, `/sources` (`/projects`), `/source <source_id>` (`/info <source_id>`), `/channels`, `/channel <channel>` — просмотр runtime settings из SQLite.
+- `/pending`, `/approvechat`, `/rejectchat`, `/addchat_here`, `/removechat`, `/enablechat`, `/disablechat`, `/setchatenabled`, `/addadmin`, `/removeadmin`, `/chatadmins`, `/addchatadmin`, `/removechatadmin`, `/setchatalias`, `/setchattitle`, `/setchatdelivery`, `/setchatschedule`, `/setstartupsummary` — admin chat/admin management в SQLite.
+- `/testsource`, `/addrepo`, `/addsource`, `/pendingsources`, `/confirmsource`, `/rejectsource`, `/enablesource`, `/disablesource`, `/setsourceprivate`, `/removesource` — safe source management через staging/approval; source validation использует текущий parser/network path.
 - `/reload`, `/status`, `/subscriptions [chat_id|alias]` — operational read-команды для admins.
-- `/subscribe` (`/link`), `/unsubscribe` (`/unlink`), `/subscribe_here`, `/unsubscribe_here` — admin-команды подписок с routing reload.
+- `/subscribe` (`/link`), `/unsubscribe` (`/unlink`), `/subscribe_here`, `/unsubscribe_here`, `/channel_subscribe`, `/channel_unsubscribe` — admin-команды подписок с routing reload.
+
+`chat_admins` внутри chat могут добавлять только новые публичные sources, управлять подписками и менять `enabled`/`delivery_mode`/`summary_schedule` только своих чатов. Sources с `private: true` видят и редактируют только full admins.
 
 ## Admin Runbook
 
@@ -116,7 +118,7 @@ python bot.py --import-settings data/settings-backup.yaml --replace
 
 5. Subscribe: добавь источник в чат через `/subscribe <source_id> [chat_id|alias]`, `/link <source_id> <chat_id|alias>` или `/subscribe_here <source_id>`.
 
-6. Check status: используй `/status`, `/subscriptions [chat_id|alias]`, `/chats`, `/sources` и `/source <source_id>`; локально можно запустить `python bot.py --self-test-admin-helpers`.
+6. Check status: используй `/status`, `/routing [chat_id|alias]`, `/deliveries [chat_id|alias]`, `/schedule [chat_id|alias]`, `/subscriptions [chat_id|alias]`, `/chats`, `/sources` и `/source <source_id>`; локально можно запустить `python bot.py --self-test-admin-helpers`.
 
 ## Документация
 

@@ -541,6 +541,7 @@ class ChatRouting:
     chat_id: str
     groups: set[str]
     source_ids: set[str]
+    chat_admins: dict[str, str | None] = field(default_factory=dict)
     title: str | None = None
     alias: str | None = None
     enabled: bool = True
@@ -639,6 +640,35 @@ def bool_status(value: bool) -> str:
     return "on" if value else "off"
 
 
+def weekday_label(weekday: int | None) -> str:
+    names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    if weekday is None or weekday < 0 or weekday >= len(names):
+        return "-"
+    return names[weekday]
+
+
+def format_schedule_label(schedule: SummarySchedule) -> str:
+    if schedule.mode == "none":
+        return "none"
+    if schedule.mode == "immediate":
+        return "immediate"
+    if schedule.mode == "daily":
+        return f"daily {html.escape(schedule.time)}"
+    if schedule.mode == "weekly":
+        return f"weekly {html.escape(schedule.time)} {html.escape(weekday_label(schedule.weekday))}"
+    return html_escape_value(schedule.mode)
+
+
+def chat_command_token(chat: ChatRouting) -> str:
+    return chat.alias or chat.chat_id
+
+
+def chat_header(chat: ChatRouting) -> str:
+    alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+    title = f" {html_escape_value(chat.title)}" if chat.title else ""
+    return f"<code>{html.escape(chat.chat_id)}</code>{alias}{title}"
+
+
 def sort_telegram_ids(values: set[str] | list[str]) -> list[str]:
     return sorted(values, key=lambda item: int(item))
 
@@ -669,7 +699,7 @@ def format_chats_command(routing: RoutingConfig) -> str:
         lines.append(
             f"<code>{html.escape(chat.chat_id)}</code>{alias}{title} "
             f"enabled={bool_status(chat.enabled)} mode={html.escape(chat.delivery_mode)} "
-            f"groups={len(chat.groups)} sources={len(chat.source_ids)}"
+            f"groups={len(chat.groups)} sources={len(chat.source_ids)} chat_admins={len(chat.chat_admins)}"
         )
     return "\n".join(lines)
 
@@ -696,38 +726,65 @@ def format_pending_chats_command(conn: sqlite3.Connection) -> str:
         lines.append(
             f"<code>{html.escape(row['chat_id'])}</code>{username} {title} "
             f"type={html_escape_value(row['type'])} by={requester}\n"
+            f"commands:\n"
             f"<code>/approvechat {html.escape(row['chat_id'])}{alias_arg}</code>\n"
             f"<code>/rejectchat {html.escape(row['chat_id'])}</code>"
         )
     return "\n".join(lines)
 
 
-def format_pending_sources_command(conn: sqlite3.Connection) -> str:
-    rows = conn.execute(
-        """
-        SELECT token, source_id, preview_text, requested_by_user_id, requested_by_name, action, created_at
-        FROM pending_sources
-        ORDER BY created_at, source_id
-        """
-    ).fetchall()
+def format_pending_sources_command(
+    conn: sqlite3.Connection,
+    *,
+    requested_by_user_id: str | None = None,
+    include_private: bool = True,
+) -> str:
+    if requested_by_user_id is None:
+        rows = conn.execute(
+            """
+            SELECT token, source_id, config_yaml, preview_text, requested_by_user_id, requested_by_name, action, created_at
+            FROM pending_sources
+            ORDER BY created_at, source_id
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT token, source_id, config_yaml, preview_text, requested_by_user_id, requested_by_name, action, created_at
+            FROM pending_sources
+            WHERE requested_by_user_id = ?
+            ORDER BY created_at, source_id
+            """,
+            (requested_by_user_id,),
+        ).fetchall()
     lines = ["<b>Pending source changes</b>"]
-    if not rows:
-        lines.append("No pending source changes.")
-        return "\n".join(lines)
 
+    visible_count = 0
     for row in rows:
+        if not include_private:
+            try:
+                source = parse_source_config_text(row["source_id"], row["config_yaml"])
+            except Exception:
+                continue
+            if is_private_source(source):
+                continue
+        visible_count += 1
         requester = html_escape_value(row["requested_by_name"] or row["requested_by_user_id"])
         lines.append(
             f"<code>{html.escape(row['token'])}</code> <code>{html.escape(row['source_id'])}</code> "
             f"action={html_escape_value(row['action'])} by={requester}\n"
             f"{html_escape_value(row['preview_text'])}\n"
+            f"commands:\n"
             f"<code>/confirmsource {html.escape(row['token'])}</code>\n"
             f"<code>/rejectsource {html.escape(row['token'])}</code>"
         )
+    if visible_count == 0:
+        lines.append("No pending source changes.")
     return "\n".join(lines)
 
 
-def format_sources_command(sources: list[dict[str, Any]]) -> str:
+def format_sources_command(sources: list[dict[str, Any]], *, include_private: bool = True) -> str:
+    sources = visible_sources_for_role(sources, include_private=include_private)
     lines = ["<b>Sources</b>"]
     if not sources:
         lines.append("No runtime sources in SQLite.")
@@ -738,14 +795,24 @@ def format_sources_command(sources: list[dict[str, Any]]) -> str:
         product = html_escape_value(source.get("product"))
         source_type = html_escape_value(source.get("type"))
         enabled = bool_status(source.get("enabled", True) is not False)
-        lines.append(f"<code>{source_id}</code> {product} type={source_type} enabled={enabled}")
+        private = " private=on" if is_private_source(source) else ""
+        lines.append(f"<code>{source_id}</code> {product} type={source_type} enabled={enabled}{private}")
     return "\n".join(lines)
 
 
-def format_source_details_command(source_id: str, sources: list[dict[str, Any]], routing: RoutingConfig) -> str:
+def format_source_details_command(
+    source_id: str,
+    sources: list[dict[str, Any]],
+    routing: RoutingConfig,
+    *,
+    visible_chat_ids: set[str] | None = None,
+    include_private: bool = True,
+) -> str:
     source = next((item for item in sources if item.get("id") == source_id), None)
     if source is None:
         return f"Источник <code>{html.escape(source_id)}</code> не найден в runtime sources."
+    if is_private_source(source) and not include_private:
+        return f"Источник <code>{html.escape(source_id)}</code> не найден или недоступен."
 
     groups = sorted(group_name for group_name, group_sources in routing.source_groups.items() if source_id in group_sources)
     direct_chats = sorted(
@@ -756,11 +823,15 @@ def format_source_details_command(source_id: str, sources: list[dict[str, Any]],
         (chat for chat in routing.chats.values() if any(group_name in chat.groups for group_name in groups)),
         key=lambda item: int(item.chat_id),
     )
+    if visible_chat_ids is not None:
+        direct_chats = [chat for chat in direct_chats if chat.chat_id in visible_chat_ids]
+        group_chats = [chat for chat in group_chats if chat.chat_id in visible_chat_ids]
 
     lines = [
         f"<b>Source</b> <code>{html.escape(source_id)}</code>",
         f"product={html_escape_value(source.get('product'))}",
         f"type={html_escape_value(source.get('type'))} enabled={bool_status(source.get('enabled', True) is not False)}",
+        f"private={bool_status(is_private_source(source))}",
         f"groups={html_escape_value(', '.join(groups))}",
     ]
 
@@ -776,7 +847,13 @@ def format_source_details_command(source_id: str, sources: list[dict[str, Any]],
     return "\n".join(lines)
 
 
-def format_subscriptions_command(chat_id: str, routing: RoutingConfig) -> str:
+def format_subscriptions_command(
+    chat_id: str,
+    routing: RoutingConfig,
+    *,
+    source_lookup: dict[str, dict[str, Any]] | None = None,
+    include_private: bool = True,
+) -> str:
     chat = routing.chats.get(chat_id)
     if chat is None:
         return f"Chat <code>{html.escape(chat_id)}</code> not found."
@@ -786,9 +863,17 @@ def format_subscriptions_command(chat_id: str, routing: RoutingConfig) -> str:
         group_sources.update(routing.source_groups.get(group_name, set()))
 
     alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
-    explicit = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in sorted(chat.source_ids)) or "-"
+    def is_visible_source_id(source_id: str) -> bool:
+        if include_private or source_lookup is None:
+            return True
+        source = source_lookup.get(source_id)
+        return source is None or not is_private_source(source)
+
+    explicit_source_ids = [source_id for source_id in sorted(chat.source_ids) if is_visible_source_id(source_id)]
+    group_source_ids = [source_id for source_id in sorted(group_sources) if is_visible_source_id(source_id)]
+    explicit = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in explicit_source_ids) or "-"
     groups = ", ".join(html.escape(group_name) for group_name in sorted(chat.groups)) or "-"
-    derived = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in sorted(group_sources)) or "-"
+    derived = ", ".join(f"<code>{html.escape(source_id)}</code>" for source_id in group_source_ids) or "-"
     return "\n".join(
         [
             f"<b>Subscriptions</b> <code>{html.escape(chat.chat_id)}</code>{alias}",
@@ -797,6 +882,275 @@ def format_subscriptions_command(chat_id: str, routing: RoutingConfig) -> str:
             f"group-derived: {derived}",
         ]
     )
+
+
+def chat_effective_source_origins(chat: ChatRouting, routing: RoutingConfig) -> dict[str, set[str]]:
+    origins: dict[str, set[str]] = defaultdict(set)
+    for source_id in chat.source_ids:
+        origins[source_id].add("direct")
+    for group_name in chat.groups:
+        for source_id in routing.source_groups.get(group_name, set()):
+            origins[source_id].add(group_name)
+    return origins
+
+
+def visible_source_id(source_id: str, source_lookup: dict[str, dict[str, Any]], *, include_private: bool) -> bool:
+    if include_private:
+        return True
+    source = source_lookup.get(source_id)
+    return source is None or not is_private_source(source)
+
+
+def format_source_route_line(
+    source_id: str,
+    origins: set[str],
+    source_lookup: dict[str, dict[str, Any]],
+    *,
+    include_private: bool,
+) -> str:
+    source = source_lookup.get(source_id, {"id": source_id})
+    product = html_escape_value(source.get("product") or source_id)
+    private = " private=on" if include_private and is_private_source(source) else ""
+    origin_text = ", ".join(html.escape(origin) for origin in sorted(origins)) or "-"
+    return f"🔹<code>{html.escape(source_id)}</code> {product} via={origin_text}{private}"
+
+
+def format_routing_overview_command(
+    routing: RoutingConfig,
+    source_lookup: dict[str, dict[str, Any]],
+    *,
+    visible_chat_ids: set[str] | None = None,
+    include_private: bool = True,
+) -> str:
+    chats = [chat for chat in routing.chats.values() if visible_chat_ids is None or chat.chat_id in visible_chat_ids]
+    lines = ["<b>Routing</b>"]
+    if not chats:
+        lines.append("Нет доступных чатов.")
+        return "\n".join(lines)
+
+    for chat in sorted(chats, key=lambda item: int(item.chat_id)):
+        origins = chat_effective_source_origins(chat, routing)
+        visible_effective = [
+            source_id
+            for source_id in origins
+            if visible_source_id(source_id, source_lookup, include_private=include_private)
+        ]
+        lines.extend(
+            [
+                "",
+                f"🔹{chat_header(chat)} enabled={bool_status(chat.enabled)} delivery={html.escape(chat.delivery_mode)} "
+                f"schedule={format_schedule_label(chat.summary_schedule)} startup={bool_status(chat.summary_on_startup)}",
+                f"sources: direct={len(chat.source_ids)} channels={len(chat.groups)} effective={len(visible_effective)}",
+                f"<code>/routing {html.escape(chat_command_token(chat))}</code>",
+                f"<code>/setchatdelivery {html.escape(chat_command_token(chat))} digest</code>",
+                f"<code>/setchatschedule {html.escape(chat_command_token(chat))} daily 08:00</code>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def format_routing_chat_command(
+    chat_id: str,
+    routing: RoutingConfig,
+    source_lookup: dict[str, dict[str, Any]],
+    *,
+    include_private: bool = True,
+) -> str:
+    chat = routing.chats.get(chat_id)
+    if chat is None:
+        return f"Чат <code>{html.escape(chat_id)}</code> не найден."
+
+    chat_token = chat_command_token(chat)
+    origins = chat_effective_source_origins(chat, routing)
+    visible_direct = [
+        source_id
+        for source_id in sorted(chat.source_ids)
+        if visible_source_id(source_id, source_lookup, include_private=include_private)
+    ]
+    visible_effective = [
+        source_id
+        for source_id in sorted(origins)
+        if visible_source_id(source_id, source_lookup, include_private=include_private)
+    ]
+
+    lines = [
+        f"<b>Routing</b> {chat_header(chat)}",
+        f"enabled={bool_status(chat.enabled)}",
+        f"delivery={html.escape(chat.delivery_mode)}",
+        f"schedule={format_schedule_label(chat.summary_schedule)}",
+        f"summary_on_startup={bool_status(chat.summary_on_startup)}",
+        "",
+        "<b>Настройки</b>",
+        f"<code>/setchatenabled {html.escape(chat_token)} on</code>",
+        f"<code>/setchatdelivery {html.escape(chat_token)} digest</code>",
+        f"<code>/setchatschedule {html.escape(chat_token)} daily 08:00</code>",
+        f"<code>/setstartupsummary {html.escape(chat_token)} off</code>",
+        "",
+        "<b>Direct sources</b>",
+    ]
+
+    if visible_direct:
+        for source_id in visible_direct:
+            lines.append(format_source_route_line(source_id, {"direct"}, source_lookup, include_private=include_private))
+            lines.append(f"<code>/unsubscribe {html.escape(source_id)} {html.escape(chat_token)}</code>")
+    else:
+        lines.append("-")
+
+    lines.extend(["", "<b>Channels</b>"])
+    if chat.groups:
+        for channel_name in sorted(chat.groups):
+            source_count = sum(
+                1
+                for source_id in routing.source_groups.get(channel_name, set())
+                if visible_source_id(source_id, source_lookup, include_private=include_private)
+            )
+            lines.append(f"🔹<code>{html.escape(channel_name)}</code> sources={source_count}")
+            lines.append(f"<code>/channel_unsubscribe {html.escape(channel_name)} {html.escape(chat_token)}</code>")
+    else:
+        lines.append("-")
+
+    lines.extend(["", "<b>Total effective sources</b>"])
+    if visible_effective:
+        for source_id in visible_effective:
+            lines.append(format_source_route_line(source_id, origins[source_id], source_lookup, include_private=include_private))
+    else:
+        lines.append("-")
+    return "\n".join(lines)
+
+
+def format_deliveries_command(
+    routing: RoutingConfig,
+    source_lookup: dict[str, dict[str, Any]],
+    *,
+    visible_chat_ids: set[str] | None = None,
+    include_private: bool = True,
+) -> str:
+    chats = [chat for chat in routing.chats.values() if visible_chat_ids is None or chat.chat_id in visible_chat_ids]
+    lines = ["<b>Delivery Matrix</b>"]
+    if not chats:
+        lines.append("Нет доступных чатов.")
+        return "\n".join(lines)
+
+    for chat in sorted(chats, key=lambda item: int(item.chat_id)):
+        direct = [
+            f"<code>{html.escape(source_id)}</code>"
+            for source_id in sorted(chat.source_ids)
+            if visible_source_id(source_id, source_lookup, include_private=include_private)
+        ]
+        channels = [f"<code>{html.escape(group_name)}</code>" for group_name in sorted(chat.groups)]
+        lines.extend(
+            [
+                "",
+                f"🔹{chat_header(chat)} delivery={html.escape(chat.delivery_mode)} schedule={format_schedule_label(chat.summary_schedule)}",
+                f"direct: {', '.join(direct) if direct else '-'}",
+                f"channels: {', '.join(channels) if channels else '-'}",
+                f"<code>/routing {html.escape(chat_command_token(chat))}</code>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def format_schedule_command(routing: RoutingConfig, *, visible_chat_ids: set[str] | None = None) -> str:
+    chats = [chat for chat in routing.chats.values() if visible_chat_ids is None or chat.chat_id in visible_chat_ids]
+    lines = ["<b>Schedules</b>"]
+    if not chats:
+        lines.append("Нет доступных чатов.")
+        return "\n".join(lines)
+
+    for chat in sorted(chats, key=lambda item: int(item.chat_id)):
+        chat_token = chat_command_token(chat)
+        lines.extend(
+            [
+                f"🔹{chat_header(chat)} delivery={html.escape(chat.delivery_mode)} "
+                f"schedule={format_schedule_label(chat.summary_schedule)} startup={bool_status(chat.summary_on_startup)}",
+                f"<code>/setchatschedule {html.escape(chat_token)} daily 08:00</code>",
+                f"<code>/setstartupsummary {html.escape(chat_token)} off</code>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def format_my_chats_command(routing: RoutingConfig, chat_ids: set[str]) -> str:
+    lines = ["<b>Мои чаты</b>"]
+    chats = [chat for chat in routing.chats.values() if chat.chat_id in chat_ids]
+    if not chats:
+        lines.append("Нет доступных чатов.")
+        return "\n".join(lines)
+
+    for chat in sorted(chats, key=lambda item: int(item.chat_id)):
+        alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+        title = f" {html_escape_value(chat.title)}" if chat.title else ""
+        lines.append(
+            f"<code>{html.escape(chat.chat_id)}</code>{alias}{title} "
+            f"enabled={bool_status(chat.enabled)} mode={html.escape(chat.delivery_mode)} "
+            f"groups={len(chat.groups)} sources={len(chat.source_ids)}"
+        )
+    return "\n".join(lines)
+
+
+def format_chat_admins_command(routing: RoutingConfig, chat_id: str | None = None) -> str:
+    lines = ["<b>Chat admins</b>"]
+    chats = [routing.chats[chat_id]] if chat_id and chat_id in routing.chats else list(routing.chats.values())
+    if chat_id and chat_id not in routing.chats:
+        return f"Chat <code>{html.escape(chat_id)}</code> not found."
+
+    found = False
+    for chat in sorted(chats, key=lambda item: int(item.chat_id)):
+        if not chat.chat_admins:
+            continue
+        found = True
+        alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+        lines.append(f"<code>{html.escape(chat.chat_id)}</code>{alias}")
+        for user_id in sorted(chat.chat_admins, key=int):
+            admin_alias = chat.chat_admins[user_id]
+            suffix = f" @{html_escape_value(admin_alias)}" if admin_alias else ""
+            lines.append(f"- <code>{html.escape(user_id)}</code>{suffix}")
+            lines.append(f"  <code>/removechatadmin {html.escape(chat.chat_id)} {html.escape(admin_alias or user_id)}</code>")
+
+    if not found:
+        lines.append("No chat admins in routing state.")
+    return "\n".join(lines)
+
+
+def format_channels_command(routing: RoutingConfig) -> str:
+    lines = ["<b>Каналы источников</b>"]
+    if not routing.source_groups:
+        lines.append("Нет каналов источников.")
+        return "\n".join(lines)
+
+    for channel_name, source_ids in sorted(routing.source_groups.items()):
+        chat_count = sum(1 for chat in routing.chats.values() if channel_name in chat.groups)
+        lines.append(
+            f"<code>{html.escape(channel_name)}</code> sources={len(source_ids)} chats={chat_count} "
+            f"<code>/channel {html.escape(channel_name)}</code>"
+        )
+    return "\n".join(lines)
+
+
+def format_channel_command(channel_name: str, routing: RoutingConfig, source_lookup: dict[str, dict[str, Any]]) -> str:
+    if channel_name not in routing.source_groups:
+        return f"Канал <code>{html.escape(channel_name)}</code> не найден."
+
+    lines = [f"<b>Канал источников</b> <code>{html.escape(channel_name)}</code>"]
+    lines.append("sources:")
+    for source_id in sorted(routing.source_groups[channel_name]):
+        source = source_lookup.get(source_id, {"id": source_id})
+        private = " private=on" if is_private_source(source) else ""
+        lines.append(f"- <code>{html.escape(source_id)}</code> {html_escape_value(source.get('product'))}{private}")
+        lines.append(f"  <code>/channel_removesource {html.escape(channel_name)} {html.escape(source_id)}</code>")
+    if not routing.source_groups[channel_name]:
+        lines.append("-")
+
+    lines.append("chats:")
+    chats = sorted((chat for chat in routing.chats.values() if channel_name in chat.groups), key=lambda item: int(item.chat_id))
+    for chat in chats:
+        alias = f" @{html_escape_value(chat.alias)}" if chat.alias else ""
+        title = f" {html_escape_value(chat.title)}" if chat.title else ""
+        lines.append(f"- <code>{html.escape(chat.chat_id)}</code>{alias}{title}")
+        lines.append(f"  <code>/channel_unsubscribe {html.escape(channel_name)} {html.escape(chat.alias or chat.chat_id)}</code>")
+    if not chats:
+        lines.append("-")
+    return "\n".join(lines)
 
 
 def safe_db_path_label(db_path: str | Path) -> str:
@@ -855,13 +1209,15 @@ def format_id_command(message: dict[str, Any]) -> str:
     return f"user_id=<code>{user_id}</code>\nchat_id=<code>{chat_id}</code>"
 
 
-def format_help_command(is_admin: bool) -> str:
+def format_help_command(is_admin: bool, is_chat_admin: bool = False) -> str:
     lines = [
         "<b>Справка по командам</b>",
         "🔸 доступно всем",
     ]
     if is_admin:
-        lines.append("🔹 только админам")
+        lines.append("🔹 только полным админам")
+    elif is_chat_admin:
+        lines.append("🔹 админам чата")
 
     lines.extend(
         [
@@ -876,6 +1232,51 @@ def format_help_command(is_admin: bool) -> str:
     )
 
     if not is_admin:
+        if is_chat_admin:
+            lines.extend(
+                [
+                    "",
+                    "<b>Мои чаты</b>",
+                    "🔹<code>/mychats</code> - показать чаты, которыми ты можешь управлять.",
+                    "🔹<code>/routing [chat_id|alias]</code> - показать что, куда и когда отправляется по твоим чатам.",
+                    "🔹<code>/deliveries [chat_id|alias]</code> - показать матрицу direct sources и channels по твоим чатам.",
+                    "🔹<code>/schedule [chat_id|alias]</code> - показать расписание digest по твоим чатам.",
+                    "🔹<code>/subscriptions [chat_id|alias]</code> - показать подписки своего чата.",
+                    "🔹<code>/subscribe &lt;source_id&gt; [chat_id|alias]</code> - подписать свой чат на публичный источник.",
+                    "🔹<code>/unsubscribe &lt;source_id&gt; [chat_id|alias]</code> - отписать свой чат от источника.",
+                    "🔹<code>/link &lt;source_id&gt; &lt;chat_id|alias&gt;</code> - то же, что /subscribe, но чат обязателен.",
+                    "🔹<code>/unlink &lt;source_id&gt; &lt;chat_id|alias&gt;</code> - то же, что /unsubscribe, но чат обязателен.",
+                    "🔹<code>/subscribe_here &lt;source_id&gt;</code> - подписать текущий чат, если он тебе доступен.",
+                    "🔹<code>/unsubscribe_here &lt;source_id&gt;</code> - отписать текущий чат, если он тебе доступен.",
+                    "🔹<code>/setchatenabled &lt;chat_id|alias&gt; &lt;on|off&gt;</code> - включить или выключить отправку в свой чат.",
+                    "🔹<code>/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;</code> - настроить режим доставки своего чата.",
+                    "🔹<code>/setchatschedule &lt;chat_id|alias&gt; &lt;none|immediate|daily|weekly&gt; [time] [weekday]</code> - настроить digest-расписание своего чата.",
+                    "🔹<code>/setstartupsummary &lt;chat_id|alias&gt; &lt;on|off&gt;</code> - разрешить или запретить digest сразу после рестарта.",
+                    "",
+                    "<b>Источники</b>",
+                    "🔹<code>/sources</code> - показать публичные источники.",
+                    "🔹<code>/source &lt;source_id&gt;</code> - показать детали публичного источника.",
+                    "🔹<code>/testsource &lt;source_id&gt;</code> - проверить публичный источник и показать preview.",
+                    "🔹<code>/addrepo &lt;owner/repo|github_url&gt; [source_id] [product name...]</code> - предложить новый GitHub Releases источник.",
+                    "🔹<code>/addsource &lt;source_id&gt; &lt;type&gt; &lt;url&gt; | &lt;product name&gt;</code> - предложить новый источник вручную.",
+                    "🔹<code>/pendingsources</code> - показать свои источники, ожидающие подтверждения.",
+                    "🔹<code>/confirmsource &lt;token&gt;</code> - применить свой новый источник.",
+                    "🔹<code>/rejectsource &lt;token&gt;</code> - отклонить свой ожидающий источник.",
+                    "",
+                    "<b>Параметры</b>",
+                    "<code>instant</code> - отправлять каждый релиз сразу.",
+                    "<code>digest</code> - не слать сразу, копить и отправлять сводкой.",
+                    "<code>both</code> - отправлять сразу и дополнительно включать в сводку.",
+                    "<code>none</code> - ничего не отправлять в чат.",
+                    "<code>immediate</code> - отправлять digest сразу при наличии новых записей.",
+                    "<code>daily HH:MM</code> - отправлять digest каждый день в указанное время.",
+                    "<code>weekly HH:MM weekday</code> - отправлять digest раз в неделю; weekday: monday..sunday или пн..вс.",
+                    "<code>on|off</code> - включить или выключить настройку.",
+                    "<code>github_releases</code> - источник из GitHub Releases.",
+                    "<code>markdown_changelog</code> - источник из Markdown changelog.",
+                    "<code>html_changelog</code> - источник из HTML changelog.",
+                ]
+            )
         return "\n".join(lines)
 
     lines.extend(
@@ -886,11 +1287,17 @@ def format_help_command(is_admin: bool) -> str:
             "🔹<code>/admins</code> - показать список админов.",
             "🔹<code>/chats</code> - показать подключённые чаты.",
             "🔹<code>/contacts</code> - то же, что /chats.",
+            "🔹<code>/mychats</code> - показать чаты, где ты chat admin.",
+            "🔹<code>/routing [chat_id|alias]</code> - показать что, куда и когда отправляется.",
+            "🔹<code>/deliveries [chat_id|alias]</code> - показать матрицу direct sources и channels по чатам.",
+            "🔹<code>/schedule [chat_id|alias]</code> - показать digest-расписание чатов.",
             "🔹<code>/sources</code> - показать источники changelog/release.",
             "🔹<code>/projects</code> - то же, что /sources.",
             "🔹<code>/source &lt;source_id&gt;</code> - показать детали источника.",
             "🔹<code>/info &lt;source_id&gt;</code> - то же, что /source.",
             "🔹<code>/subscriptions [chat_id|alias]</code> - показать подписки чата.",
+            "🔹<code>/channels</code> - показать каналы источников.",
+            "🔹<code>/channel &lt;channel&gt;</code> - показать источники и чаты канала.",
             "",
             "<b>Чаты</b>",
             "🔹<code>/pending</code> - показать заявки на добавление чатов.",
@@ -900,9 +1307,15 @@ def format_help_command(is_admin: bool) -> str:
             "🔹<code>/removechat &lt;chat_id|alias&gt;</code> - удалить чат из роутинга.",
             "🔹<code>/enablechat &lt;chat_id|alias&gt;</code> - включить отправку в чат.",
             "🔹<code>/disablechat &lt;chat_id|alias&gt;</code> - выключить отправку в чат.",
+            "🔹<code>/setchatenabled &lt;chat_id|alias&gt; &lt;on|off&gt;</code> - включить или выключить отправку в чат.",
             "🔹<code>/setchatalias &lt;chat_id|alias&gt; &lt;alias|-&gt;</code> - задать или сбросить alias чата.",
             "🔹<code>/setchattitle &lt;chat_id|alias&gt; &lt;title|-&gt;</code> - задать или сбросить название чата.",
             "🔹<code>/setchatdelivery &lt;chat_id|alias&gt; &lt;instant|digest|both|none&gt;</code> - настроить режим доставки.",
+            "🔹<code>/setchatschedule &lt;chat_id|alias&gt; &lt;none|immediate|daily|weekly&gt; [time] [weekday]</code> - настроить digest-расписание.",
+            "🔹<code>/setstartupsummary &lt;chat_id|alias&gt; &lt;on|off&gt;</code> - разрешить или запретить digest сразу после рестарта.",
+            "🔹<code>/chatadmins [chat_id|alias]</code> - показать админов чата.",
+            "🔹<code>/addchatadmin &lt;chat_id|alias&gt; &lt;user_id&gt; [alias]</code> - добавить админа чата.",
+            "🔹<code>/removechatadmin &lt;chat_id|alias&gt; &lt;user_id|alias&gt;</code> - удалить админа чата.",
             "",
             "<b>Источники</b>",
             "🔹<code>/testsource &lt;source_id&gt;</code> - проверить парсинг источника и показать preview.",
@@ -913,7 +1326,18 @@ def format_help_command(is_admin: bool) -> str:
             "🔹<code>/rejectsource &lt;token&gt;</code> - отклонить ожидающий источник.",
             "🔹<code>/enablesource &lt;source_id&gt;</code> - включить источник.",
             "🔹<code>/disablesource &lt;source_id&gt;</code> - выключить источник.",
+            "🔹<code>/setsourceprivate &lt;source_id&gt; &lt;on|off&gt;</code> - скрыть или открыть источник для chat admins.",
             "🔹<code>/removesource &lt;source_id&gt;</code> - удалить источник.",
+            "",
+            "<b>Каналы источников</b>",
+            "🔹<code>/addchannel &lt;channel&gt;</code> - создать канал источников.",
+            "🔹<code>/removechannel &lt;channel&gt;</code> - удалить пустой канал источников.",
+            "🔹<code>/channel_addsource &lt;channel&gt; &lt;source_id&gt;</code> - добавить источник в канал.",
+            "🔹<code>/channel_removesource &lt;channel&gt; &lt;source_id&gt;</code> - убрать источник из канала.",
+            "🔹<code>/channel_subscribe &lt;channel&gt; [chat_id|alias]</code> - подписать чат на канал.",
+            "🔹<code>/channel_unsubscribe &lt;channel&gt; [chat_id|alias]</code> - отписать чат от канала.",
+            "🔹<code>/channel_subscribe_here &lt;channel&gt;</code> - подписать текущий чат на канал.",
+            "🔹<code>/channel_unsubscribe_here &lt;channel&gt;</code> - отписать текущий чат от канала.",
             "",
             "<b>Подписки</b>",
             "🔹<code>/subscribe &lt;source_id&gt; [chat_id|alias]</code> - подписать чат на источник.",
@@ -927,9 +1351,52 @@ def format_help_command(is_admin: bool) -> str:
             "🔹<code>/addadmin &lt;user_id&gt; [alias]</code> - добавить админа.",
             "🔹<code>/removeadmin &lt;user_id|alias&gt;</code> - удалить админа.",
             "🔹<code>/reload</code> - перечитать routing config и применить изменения.",
+            "",
+            "<b>Параметры</b>",
+            "<code>instant</code> - отправлять каждый релиз сразу.",
+            "<code>digest</code> - не слать сразу, копить и отправлять сводкой.",
+            "<code>both</code> - отправлять сразу и дополнительно включать в сводку.",
+            "<code>none</code> - ничего не отправлять в чат; для schedule - не отправлять digest.",
+            "<code>immediate</code> - отправлять digest сразу при наличии новых записей.",
+            "<code>daily HH:MM</code> - отправлять digest каждый день в указанное время.",
+            "<code>weekly HH:MM weekday</code> - отправлять digest раз в неделю; weekday: monday..sunday или пн..вс.",
+            "<code>on|off</code> - включить или выключить настройку.",
+            "<code>github_releases</code> - источник из GitHub Releases.",
+            "<code>markdown_changelog</code> - источник из Markdown changelog.",
+            "<code>html_changelog</code> - источник из HTML changelog.",
+            "<code>private</code> source - виден и управляется только full admins.",
         ]
     )
     return "\n".join(lines)
+
+
+CHAT_ADMIN_COMMANDS = {
+    "sources",
+    "projects",
+    "source",
+    "info",
+    "testsource",
+    "addrepo",
+    "addsource",
+    "pendingsources",
+    "confirmsource",
+    "rejectsource",
+    "subscriptions",
+    "routing",
+    "deliveries",
+    "schedule",
+    "subscribe",
+    "unsubscribe",
+    "link",
+    "unlink",
+    "subscribe_here",
+    "unsubscribe_here",
+    "setchatenabled",
+    "setchatdelivery",
+    "setchatschedule",
+    "setstartupsummary",
+    "mychats",
+}
 
 
 def self_test_admin_helpers() -> None:
@@ -942,6 +1409,7 @@ def self_test_admin_helpers() -> None:
                 chat_id="-100",
                 groups={"all&more"},
                 source_ids={"source<one>"},
+                chat_admins={"456": "helper&one"},
                 title="Chat <Title>",
                 alias="main&ops",
                 enabled=True,
@@ -980,7 +1448,13 @@ def self_test_admin_helpers() -> None:
         conn.commit()
         outputs = [
             format_admins_command(routing),
+            format_chat_admins_command(routing),
             format_chats_command(routing),
+            format_my_chats_command(routing, {"-100"}),
+            format_routing_overview_command(routing, {"source<one>": sources[0]}),
+            format_routing_chat_command("-100", routing, {"source<one>": sources[0]}),
+            format_deliveries_command(routing, {"source<one>": sources[0]}),
+            format_schedule_command(routing),
             format_sources_command(sources),
             format_source_details_command("source<one>", sources, routing),
             format_subscriptions_command("-100", routing),
@@ -992,6 +1466,7 @@ def self_test_admin_helpers() -> None:
     expected_fragments = [
         "root&lt;admin&gt;",
         "main&amp;ops",
+        "helper&amp;one",
         "Chat &lt;Title&gt;",
         "Product &lt;One&gt;",
         "source&lt;one&gt;",
@@ -1054,6 +1529,48 @@ def is_authorized_admin(admins: set[str], raw_user_id: Any) -> bool:
         return False
 
     return user_id in admins
+
+
+def normalize_user_id(value: Any, field: str = "user_id") -> str:
+    normalized = normalize_chat_id(value, field)
+    if normalized.startswith("-"):
+        raise ValueError(f"{field} must be a valid telegram user id: {value!r}")
+    return normalized
+
+
+def normalized_message_user_id(message: dict[str, Any]) -> str | None:
+    raw_user_id = (message.get("from") or {}).get("id")
+    if raw_user_id is None:
+        return None
+    try:
+        return normalize_user_id(raw_user_id, "from.id")
+    except ValueError:
+        return None
+
+
+def chat_admin_chat_ids(routing: RoutingConfig, raw_user_id: Any) -> set[str]:
+    if raw_user_id is None:
+        return set()
+    try:
+        user_id = normalize_user_id(raw_user_id, "user_id")
+    except ValueError:
+        return set()
+    return {
+        chat.chat_id
+        for chat in routing.chats.values()
+        if user_id in chat.chat_admins
+    }
+
+
+def is_private_source(source: dict[str, Any]) -> bool:
+    source_id = normalize_string(source.get("id")) or "unknown"
+    return parse_bool_value(source.get("private"), f"source {source_id}.private", default=False)
+
+
+def visible_sources_for_role(sources: list[dict[str, Any]], *, include_private: bool) -> list[dict[str, Any]]:
+    if include_private:
+        return sources
+    return [source for source in sources if not is_private_source(source)]
 
 
 def load_source_ids(config_path: str | Path) -> set[str]:
@@ -1161,11 +1678,13 @@ def stage_pending_source_db(
     return token
 
 
-def apply_pending_source_db(conn: sqlite3.Connection, token: str) -> str:
+def apply_pending_source_db(conn: sqlite3.Connection, token: str, *, create_only: bool = False) -> str:
     row = conn.execute("SELECT * FROM pending_sources WHERE token = ?", (token,)).fetchone()
     if row is None:
         raise ValueError(f"pending source token '{token}' not found")
     source = parse_source_config_text(row["source_id"], row["config_yaml"])
+    if create_only and conn.execute("SELECT 1 FROM runtime_sources WHERE source_id = ?", (source["id"],)).fetchone():
+        raise ValueError(f"source '{source['id']}' already exists; chat admins cannot overwrite sources")
     import_sources_to_db(conn, [source], replace=False, commit=False)
     conn.execute("DELETE FROM pending_sources WHERE token = ?", (token,))
     conn.commit()
@@ -1188,6 +1707,25 @@ def set_source_enabled_db(conn: sqlite3.Connection, source_id: str, enabled: boo
         raise ValueError(f"source '{normalized_source_id}' not found")
     source = parse_source_config_text(normalized_source_id, row["config_yaml"])
     source["enabled"] = bool(enabled)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE runtime_sources SET config_yaml = ?, updated_at = ? WHERE source_id = ?",
+        (source_config_to_yaml_text(source), now, normalized_source_id),
+    )
+    conn.commit()
+    return normalized_source_id
+
+
+def set_source_private_db(conn: sqlite3.Connection, source_id: str, private: bool) -> str:
+    normalized_source_id = normalize_source_id(source_id)
+    row = conn.execute("SELECT config_yaml FROM runtime_sources WHERE source_id = ?", (normalized_source_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"source '{normalized_source_id}' not found")
+    source = parse_source_config_text(normalized_source_id, row["config_yaml"])
+    if private:
+        source["private"] = True
+    else:
+        source.pop("private", None)
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE runtime_sources SET config_yaml = ?, updated_at = ? WHERE source_id = ?",
@@ -1375,6 +1913,7 @@ def replace_routing_tables(conn: sqlite3.Connection) -> None:
 def delete_routing_tables(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM routing_chat_sources")
     conn.execute("DELETE FROM routing_chat_groups")
+    conn.execute("DELETE FROM routing_chat_admins")
     conn.execute("DELETE FROM routing_source_group_sources")
     conn.execute("DELETE FROM routing_source_groups")
     conn.execute("DELETE FROM routing_chats")
@@ -1464,6 +2003,15 @@ def import_routing_config_to_db(
                 (chat.chat_id, source_id),
             )
 
+        for user_id in sorted(chat.chat_admins, key=int):
+            conn.execute(
+                """
+                INSERT INTO routing_chat_admins(chat_id, user_id, alias) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET alias = excluded.alias
+                """,
+                (chat.chat_id, user_id, chat.chat_admins[user_id]),
+            )
+
     if commit:
         conn.commit()
 
@@ -1517,6 +2065,97 @@ def apply_chat_subscription_change_db(
 def apply_chat_subscription_change(db_path: str | Path, source_id: str, chat_id: str, *, add: bool, chat_title: str | None = None) -> str:
     with db_connect(db_path) as conn:
         return apply_chat_subscription_change_db(conn, source_id, chat_id, add=add, chat_title=chat_title)
+
+
+def normalize_channel_name(value: Any) -> str:
+    channel_name = normalize_alias(value)
+    if not channel_name:
+        raise ValueError("channel name must be non-empty")
+    return channel_name
+
+
+def add_channel_db(conn: sqlite3.Connection, channel_name: str) -> str:
+    normalized_channel = normalize_channel_name(channel_name)
+    cursor = conn.execute("INSERT OR IGNORE INTO routing_source_groups(group_name) VALUES (?)", (normalized_channel,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        return f"канал {normalized_channel} уже существует"
+    return f"канал {normalized_channel} создан"
+
+
+def remove_channel_db(conn: sqlite3.Connection, channel_name: str) -> str:
+    normalized_channel = normalize_channel_name(channel_name)
+    source_refs = conn.execute(
+        "SELECT COUNT(*) FROM routing_source_group_sources WHERE group_name = ?",
+        (normalized_channel,),
+    ).fetchone()[0]
+    chat_refs = conn.execute(
+        "SELECT COUNT(*) FROM routing_chat_groups WHERE group_name = ?",
+        (normalized_channel,),
+    ).fetchone()[0]
+    if source_refs or chat_refs:
+        raise ValueError(f"channel '{normalized_channel}' is not empty: sources={source_refs} chats={chat_refs}")
+    cursor = conn.execute("DELETE FROM routing_source_groups WHERE group_name = ?", (normalized_channel,))
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise ValueError(f"channel '{normalized_channel}' not found")
+    return f"канал {normalized_channel} удалён"
+
+
+def apply_channel_source_change_db(conn: sqlite3.Connection, channel_name: str, source_id: str, *, add: bool) -> str:
+    normalized_channel = normalize_channel_name(channel_name)
+    normalized_source_id = normalize_source_id(source_id)
+    if not conn.execute("SELECT 1 FROM routing_source_groups WHERE group_name = ?", (normalized_channel,)).fetchone():
+        raise ValueError(f"channel '{normalized_channel}' not found")
+    if not conn.execute("SELECT 1 FROM runtime_sources WHERE source_id = ?", (normalized_source_id,)).fetchone():
+        raise ValueError(f"source '{normalized_source_id}' not found")
+
+    if add:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO routing_source_group_sources(group_name, source_id) VALUES (?, ?)",
+            (normalized_channel, normalized_source_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return f"источник {normalized_source_id} уже есть в канале {normalized_channel}"
+        return f"источник {normalized_source_id} добавлен в канал {normalized_channel}"
+
+    cursor = conn.execute(
+        "DELETE FROM routing_source_group_sources WHERE group_name = ? AND source_id = ?",
+        (normalized_channel, normalized_source_id),
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        return f"источника {normalized_source_id} нет в канале {normalized_channel}"
+    return f"источник {normalized_source_id} удалён из канала {normalized_channel}"
+
+
+def apply_channel_subscription_change_db(conn: sqlite3.Connection, channel_name: str, chat_id: str, *, add: bool) -> str:
+    normalized_channel = normalize_channel_name(channel_name)
+    normalized_chat_id = normalize_chat_id(chat_id, "chat_id")
+    if not conn.execute("SELECT 1 FROM routing_source_groups WHERE group_name = ?", (normalized_channel,)).fetchone():
+        raise ValueError(f"channel '{normalized_channel}' not found")
+    if not conn.execute("SELECT 1 FROM routing_chats WHERE chat_id = ?", (normalized_chat_id,)).fetchone():
+        raise ValueError(f"chat '{normalized_chat_id}' not found")
+
+    if add:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO routing_chat_groups(chat_id, group_name) VALUES (?, ?)",
+            (normalized_chat_id, normalized_channel),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return f"чат {normalized_chat_id} уже подписан на канал {normalized_channel}"
+        return f"чат {normalized_chat_id} подписан на канал {normalized_channel}"
+
+    cursor = conn.execute(
+        "DELETE FROM routing_chat_groups WHERE chat_id = ? AND group_name = ?",
+        (normalized_chat_id, normalized_channel),
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        return f"чат {normalized_chat_id} не подписан на канал {normalized_channel}"
+    return f"чат {normalized_chat_id} отписан от канала {normalized_channel}"
 
 
 def requested_by_name(user: dict[str, Any]) -> str | None:
@@ -1615,6 +2254,64 @@ def remove_admin_db(conn: sqlite3.Connection, identifier: str) -> str:
     if cursor.rowcount == 0:
         raise ValueError(f"admin '{identifier}' not found")
     return user_id
+
+
+def resolve_chat_admin_identifier_db(conn: sqlite3.Connection, chat_id: str, identifier: str) -> str | None:
+    normalized = normalize_string(identifier)
+    if not normalized:
+        return None
+    alias = normalize_alias(normalized)
+    if alias:
+        row = conn.execute(
+            "SELECT user_id FROM routing_chat_admins WHERE chat_id = ? AND lower(alias) = ?",
+            (chat_id, alias),
+        ).fetchone()
+        if row:
+            return normalize_user_id(row["user_id"], "chat admin alias")
+    try:
+        return normalize_user_id(normalized, "chat admin identifier")
+    except ValueError:
+        return None
+
+
+def add_chat_admin_db(conn: sqlite3.Connection, chat_identifier: str, user_id: str, alias: str | None, routing: RoutingConfig) -> tuple[str, str]:
+    chat_id = resolve_chat_identifier(chat_identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{chat_identifier}' not found")
+    normalized_user_id = normalize_user_id(user_id)
+    if alias:
+        existing = conn.execute(
+            "SELECT user_id FROM routing_chat_admins WHERE chat_id = ? AND lower(alias) = ? AND user_id != ?",
+            (chat_id, alias, normalized_user_id),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"chat admin alias '{alias}' is already used in chat {chat_id}")
+    conn.execute(
+        """
+        INSERT INTO routing_chat_admins(chat_id, user_id, alias) VALUES (?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET alias = COALESCE(excluded.alias, routing_chat_admins.alias)
+        """,
+        (chat_id, normalized_user_id, alias),
+    )
+    conn.commit()
+    return chat_id, normalized_user_id
+
+
+def remove_chat_admin_db(conn: sqlite3.Connection, chat_identifier: str, admin_identifier: str, routing: RoutingConfig) -> tuple[str, str]:
+    chat_id = resolve_chat_identifier(chat_identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{chat_identifier}' not found")
+    user_id = resolve_chat_admin_identifier_db(conn, chat_id, admin_identifier)
+    if user_id is None:
+        raise ValueError(f"chat admin '{admin_identifier}' not found in chat {chat_id}")
+    cursor = conn.execute(
+        "DELETE FROM routing_chat_admins WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id),
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise ValueError(f"chat admin '{admin_identifier}' not found in chat {chat_id}")
+    return chat_id, user_id
 
 
 def upsert_chat_db(
@@ -1720,6 +2417,55 @@ def set_chat_delivery_db(conn: sqlite3.Connection, identifier: str, routing: Rou
     return chat_id
 
 
+def parse_summary_schedule_command(args: list[str], context: str) -> SummarySchedule:
+    if not args:
+        raise ValueError("schedule mode must be provided")
+    mode = normalize_string(args[0]).lower()
+    if mode in {"none", "off", "disable", "disabled"}:
+        return SummarySchedule.disabled()
+    if mode in {"immediate", "now"}:
+        return SummarySchedule.immediate()
+    if mode == "daily":
+        if len(args) < 2:
+            raise ValueError("Usage: /setchatschedule <chat_id|alias> daily <HH:MM>")
+        return parse_summary_schedule({"mode": "daily", "time": args[1]}, context)
+    if mode == "weekly":
+        if len(args) < 3:
+            raise ValueError("Usage: /setchatschedule <chat_id|alias> weekly <HH:MM> <weekday>")
+        return parse_summary_schedule({"mode": "weekly", "time": args[1], "weekday": args[2]}, context)
+    raise ValueError("schedule mode must be one of none|immediate|daily|weekly")
+
+
+def set_chat_summary_schedule_db(
+    conn: sqlite3.Connection,
+    identifier: str,
+    routing: RoutingConfig,
+    schedule: SummarySchedule,
+) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    conn.execute(
+        """
+        UPDATE routing_chats
+        SET summary_mode = ?, summary_time = ?, summary_weekday = ?
+        WHERE chat_id = ?
+        """,
+        (schedule.mode, schedule.time, schedule.weekday, chat_id),
+    )
+    conn.commit()
+    return chat_id
+
+
+def set_chat_summary_on_startup_db(conn: sqlite3.Connection, identifier: str, routing: RoutingConfig, enabled: bool) -> str:
+    chat_id = resolve_chat_identifier(identifier, routing)
+    if chat_id is None or chat_id not in routing.chats:
+        raise ValueError(f"chat '{identifier}' not found")
+    conn.execute("UPDATE routing_chats SET summary_on_startup = ? WHERE chat_id = ?", (int(enabled), chat_id))
+    conn.commit()
+    return chat_id
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -1777,19 +2523,23 @@ def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     }
 
 
-def parse_admin_entry(raw_admin: Any, idx: int) -> tuple[str, str | None]:
-    if isinstance(raw_admin, dict):
+def parse_user_alias_entry(raw_entry: Any, context: str) -> tuple[str, str | None]:
+    if isinstance(raw_entry, dict):
         raw_admin_id = (
-            raw_admin.get("id")
-            if raw_admin.get("id") is not None
-            else (raw_admin.get("user_id") if raw_admin.get("user_id") is not None else raw_admin.get("chat_id"))
+            raw_entry.get("id")
+            if raw_entry.get("id") is not None
+            else (raw_entry.get("user_id") if raw_entry.get("user_id") is not None else raw_entry.get("chat_id"))
         )
-        alias = normalize_alias(raw_admin.get("alias"))
+        alias = normalize_alias(raw_entry.get("alias"))
         if raw_admin_id is None:
-            raise ValueError(f"admins[{idx}] must include id (or user_id) when specified as object")
-        return normalize_chat_id(raw_admin_id, f"admins[{idx}]"), alias
+            raise ValueError(f"{context} must include id (or user_id) when specified as object")
+        return normalize_user_id(raw_admin_id, context), alias
 
-    return normalize_chat_id(raw_admin, f"admins[{idx}]"), None
+    return normalize_user_id(raw_entry, context), None
+
+
+def parse_admin_entry(raw_admin: Any, idx: int) -> tuple[str, str | None]:
+    return parse_user_alias_entry(raw_admin, f"admins[{idx}]")
 
 
 def validate_summary_time(raw_time: Any, context: str) -> tuple[int, int]:
@@ -2088,6 +2838,21 @@ def load_routing_config_data(data: dict[str, Any], source_ids: set[str]) -> Rout
                 raise ValueError(f"chat {chat_id} uses unknown source '{source_id}'")
             chat_source_ids.add(source_id)
 
+        raw_chat_admins = raw_chat.get("chat_admins", [])
+        if not isinstance(raw_chat_admins, list):
+            raise ValueError(f"chats[{idx}] chat_admins must be a list")
+        chat_admins: dict[str, str | None] = {}
+        chat_admin_aliases: set[str] = set()
+        for admin_idx, raw_chat_admin in enumerate(raw_chat_admins, start=1):
+            user_id, admin_alias = parse_user_alias_entry(raw_chat_admin, f"chats[{idx}].chat_admins[{admin_idx}]")
+            if user_id in chat_admins:
+                raise ValueError(f"duplicate chat admin id {user_id} for chat {chat_id}")
+            if admin_alias:
+                if admin_alias in chat_admin_aliases:
+                    raise ValueError(f"duplicate chat admin alias '{admin_alias}' for chat {chat_id}")
+                chat_admin_aliases.add(admin_alias)
+            chat_admins[user_id] = admin_alias
+
         title = normalize_string(raw_chat.get("title")) or None
         alias = normalize_alias(raw_chat.get("alias"))
         enabled = parse_bool_value(raw_chat.get("enabled"), f"chats[{idx}].enabled", default=True)
@@ -2111,6 +2876,7 @@ def load_routing_config_data(data: dict[str, Any], source_ids: set[str]) -> Rout
             chat_id=chat_id,
             groups=chat_groups,
             source_ids=chat_source_ids,
+            chat_admins=chat_admins,
             title=title,
             alias=alias,
             enabled=enabled,
@@ -2189,6 +2955,22 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
                 raise ValueError(f"chat {chat_id} uses unknown source '{source_id}'")
             chat_source_ids.add(source_id)
 
+        chat_admins: dict[str, str | None] = {}
+        chat_admin_aliases: set[str] = set()
+        for raw_chat_admin in conn.execute(
+            "SELECT user_id, alias FROM routing_chat_admins WHERE chat_id = ? ORDER BY user_id",
+            (chat_id,),
+        ).fetchall():
+            user_id = normalize_user_id(raw_chat_admin["user_id"], f"chat {chat_id} admin")
+            if user_id in chat_admins:
+                raise ValueError(f"duplicate chat admin id {user_id} for chat {chat_id}")
+            alias = normalize_alias(raw_chat_admin["alias"]) if raw_chat_admin["alias"] is not None else None
+            if alias:
+                if alias in chat_admin_aliases:
+                    raise ValueError(f"duplicate chat admin alias '{alias}' for chat {chat_id}")
+                chat_admin_aliases.add(alias)
+            chat_admins[user_id] = alias
+
         title = normalize_string(raw_chat["title"]) or None
         enabled = bool(raw_chat["enabled"])
         send_summary = bool(raw_chat["send_summary"])
@@ -2213,6 +2995,7 @@ def load_routing_config_from_db(conn: sqlite3.Connection, source_ids: set[str]) 
             chat_id=chat_id,
             groups=chat_groups,
             source_ids=chat_source_ids,
+            chat_admins=chat_admins,
             title=title,
             alias=alias,
             enabled=enabled,
@@ -2251,11 +3034,17 @@ def routing_config_to_yaml_data(routing: RoutingConfig) -> dict[str, Any]:
         if chat.summary_schedule.mode == "weekly":
             summary_schedule["weekday"] = chat.summary_schedule.weekday
 
+        chat_admins: list[Any] = []
+        for user_id in sorted(chat.chat_admins, key=int):
+            alias = chat.chat_admins[user_id]
+            chat_admins.append({"id": user_id, "alias": alias} if alias else user_id)
+
         chats.append(
             {
                 "chat_id": chat.chat_id,
                 "alias": chat.alias,
                 "title": chat.title,
+                "chat_admins": chat_admins,
                 "groups": sorted(chat.groups),
                 "sources": sorted(chat.source_ids),
                 "enabled": chat.enabled,
@@ -2314,10 +3103,12 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
     admin_columns = table_columns(conn, "routing_admins")
     if "alias" not in admin_columns:
         conn.execute("ALTER TABLE routing_admins ADD COLUMN alias TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_admins_alias ON routing_admins(alias)")
 
     chat_columns = table_columns(conn, "routing_chats")
     if "alias" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN alias TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_chats_alias ON routing_chats(alias)")
     if "summary_mode" not in chat_columns:
         conn.execute("ALTER TABLE routing_chats ADD COLUMN summary_mode TEXT NOT NULL DEFAULT 'none'")
     if "summary_time" not in chat_columns:
@@ -2344,6 +3135,8 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
             WHERE delivery_mode = 'both'
             """
         )
+
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_routing_chat_admins_alias ON routing_chat_admins(chat_id, alias)")
 
     conn.execute(
         """
@@ -2491,6 +3284,17 @@ def initialize_database_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (chat_id, group_name),
             FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE,
             FOREIGN KEY (group_name) REFERENCES routing_source_groups(group_name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS routing_chat_admins (
+            chat_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            alias TEXT,
+            PRIMARY KEY (chat_id, user_id),
+            FOREIGN KEY (chat_id) REFERENCES routing_chats(chat_id) ON DELETE CASCADE
         )
         """
     )
@@ -4354,6 +5158,10 @@ async def run_admin_command_listener(
                         "subscribe_here",
                         "unsubscribe_here",
                         "subscriptions",
+                        "routing",
+                        "deliveries",
+                        "schedule",
+                        "mychats",
                         "start",
                         "help",
                         "id",
@@ -4369,11 +5177,27 @@ async def run_admin_command_listener(
                         "removechat",
                         "enablechat",
                         "disablechat",
+                        "setchatenabled",
                         "addadmin",
                         "removeadmin",
+                        "chatadmins",
+                        "addchatadmin",
+                        "removechatadmin",
                         "setchatalias",
                         "setchattitle",
                         "setchatdelivery",
+                        "setchatschedule",
+                        "setstartupsummary",
+                        "channels",
+                        "channel",
+                        "addchannel",
+                        "removechannel",
+                        "channel_addsource",
+                        "channel_removesource",
+                        "channel_subscribe",
+                        "channel_unsubscribe",
+                        "channel_subscribe_here",
+                        "channel_unsubscribe_here",
                         "sources",
                         "projects",
                         "source",
@@ -4386,6 +5210,7 @@ async def run_admin_command_listener(
                         "rejectsource",
                         "enablesource",
                         "disablesource",
+                        "setsourceprivate",
                         "removesource",
                     }:
                         continue
@@ -4424,19 +5249,74 @@ async def run_admin_command_listener(
                         sources = runtime_config["sources"]
                         poll_minutes = int(runtime_config.get("poll_minutes", 30))
                     source_ids = collect_source_ids(sources)
+                    source_lookup = {source["id"]: source for source in sources}
                     routing = routing_state.get(source_ids)
-                    is_admin = is_authorized_admin(routing.admins, (message.get("from") or {}).get("id"))
+                    raw_user_id = (message.get("from") or {}).get("id")
+                    user_id = normalized_message_user_id(message)
+                    is_admin = is_authorized_admin(routing.admins, raw_user_id)
+                    allowed_chat_ids = chat_admin_chat_ids(routing, raw_user_id)
+                    is_chat_admin = bool(allowed_chat_ids)
 
                     if command in {"start", "help"}:
                         await send_telegram_message(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            format_help_command(is_admin),
+                            format_help_command(is_admin, is_chat_admin),
                         )
                         continue
 
-                    if not is_admin:
+                    if not is_admin and not (is_chat_admin and command in CHAT_ADMIN_COMMANDS):
+                        continue
+
+                    if command == "mychats":
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_my_chats_command(routing, allowed_chat_ids),
+                        )
+                        continue
+
+                    if command in {"routing", "deliveries", "schedule"}:
+                        visible_chat_ids = None if is_admin else allowed_chat_ids
+                        target_chat_id = None
+                        if args:
+                            target_chat_id = resolve_chat_identifier(args[0], routing)
+                            if target_chat_id is None:
+                                await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(args[0])}</code> not found.")
+                                continue
+                            if visible_chat_ids is not None and target_chat_id not in visible_chat_ids:
+                                await send_telegram_message(
+                                    client,
+                                    telegram_token,
+                                    reply_chat_id,
+                                    f"Чат <code>{html.escape(args[0])}</code> недоступен для твоей роли.",
+                                )
+                                continue
+
+                        if command == "routing" and target_chat_id is not None:
+                            text = format_routing_chat_command(target_chat_id, routing, source_lookup, include_private=is_admin)
+                        elif command == "routing":
+                            text = format_routing_overview_command(
+                                routing,
+                                source_lookup,
+                                visible_chat_ids=visible_chat_ids,
+                                include_private=is_admin,
+                            )
+                        elif command == "deliveries":
+                            text = format_deliveries_command(
+                                routing,
+                                source_lookup,
+                                visible_chat_ids={target_chat_id} if target_chat_id is not None else visible_chat_ids,
+                                include_private=is_admin,
+                            )
+                        else:
+                            text = format_schedule_command(
+                                routing,
+                                visible_chat_ids={target_chat_id} if target_chat_id is not None else visible_chat_ids,
+                            )
+                        await send_telegram_message_chunks(client, telegram_token, reply_chat_id, text)
                         continue
 
                     if command == "reload":
@@ -4540,11 +5420,26 @@ async def run_admin_command_listener(
                             await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
-                    if command in {"removechat", "enablechat", "disablechat", "setchatalias", "setchattitle", "setchatdelivery"}:
+                    if command in {
+                        "removechat",
+                        "enablechat",
+                        "disablechat",
+                        "setchatenabled",
+                        "setchatalias",
+                        "setchattitle",
+                        "setchatdelivery",
+                        "setchatschedule",
+                        "setstartupsummary",
+                    }:
                         if not args:
                             await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;chat_id|alias&gt; ...")
                             continue
                         try:
+                            target_chat_id = resolve_chat_identifier(args[0], routing)
+                            if target_chat_id is None or target_chat_id not in routing.chats:
+                                raise ValueError(f"chat '{args[0]}' not found")
+                            if not is_admin and target_chat_id not in allowed_chat_ids:
+                                raise ValueError(f"chat '{args[0]}' is unavailable for your role")
                             with db_connect(db_path) as conn:
                                 if command == "removechat":
                                     changed_chat_id = remove_chat_db(conn, args[0], routing)
@@ -4552,6 +5447,12 @@ async def run_admin_command_listener(
                                 elif command in {"enablechat", "disablechat"}:
                                     changed_chat_id = set_chat_enabled_db(conn, args[0], routing, command == "enablechat")
                                     action = "enabled" if command == "enablechat" else "disabled"
+                                elif command == "setchatenabled":
+                                    if len(args) < 2:
+                                        raise ValueError("Usage: /setchatenabled <chat_id|alias> <on|off>")
+                                    enabled = parse_bool_value(args[1], "enabled", default=True)
+                                    changed_chat_id = set_chat_enabled_db(conn, args[0], routing, enabled)
+                                    action = f"enabled={bool_status(enabled)}"
                                 elif command == "setchatalias":
                                     if len(args) < 2:
                                         raise ValueError("Usage: /setchatalias <chat_id|alias> <alias|->")
@@ -4563,11 +5464,21 @@ async def run_admin_command_listener(
                                     title = None if args[1] == "-" else " ".join(args[1:]).strip()
                                     changed_chat_id = set_chat_title_db(conn, args[0], routing, title)
                                     action = "title updated"
-                                else:
+                                elif command == "setchatdelivery":
                                     if len(args) < 2:
                                         raise ValueError("Usage: /setchatdelivery <chat_id|alias> <instant|digest|both|none>")
                                     changed_chat_id = set_chat_delivery_db(conn, args[0], routing, args[1])
                                     action = "delivery updated"
+                                elif command == "setchatschedule":
+                                    schedule = parse_summary_schedule_command(args[1:], f"chat {target_chat_id}")
+                                    changed_chat_id = set_chat_summary_schedule_db(conn, args[0], routing, schedule)
+                                    action = f"schedule={format_schedule_label(schedule)}"
+                                else:
+                                    if len(args) < 2:
+                                        raise ValueError("Usage: /setstartupsummary <chat_id|alias> <on|off>")
+                                    enabled = parse_bool_value(args[1], "summary_on_startup", default=False)
+                                    changed_chat_id = set_chat_summary_on_startup_db(conn, args[0], routing, enabled)
+                                    action = f"summary_on_startup={bool_status(enabled)}"
                             routing_state.get(source_ids, force_reload=True)
                             reload_requested.set()
                             await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(changed_chat_id)}</code> {html.escape(action)}.")
@@ -4594,6 +5505,52 @@ async def run_admin_command_listener(
                             await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
+                    if command == "chatadmins":
+                        target_chat_id = None
+                        if args:
+                            target_chat_id = resolve_chat_identifier(args[0], routing)
+                            if target_chat_id is None:
+                                await send_telegram_message(client, telegram_token, reply_chat_id, f"Chat <code>{html.escape(args[0])}</code> not found.")
+                                continue
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_chat_admins_command(routing, target_chat_id),
+                        )
+                        continue
+
+                    if command in {"addchatadmin", "removechatadmin"}:
+                        min_args = 2
+                        if len(args) < min_args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;chat_id|alias&gt; &lt;user_id|alias&gt; [alias]")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                if command == "addchatadmin":
+                                    changed_chat_id, changed_user_id = add_chat_admin_db(
+                                        conn,
+                                        args[0],
+                                        args[1],
+                                        normalize_alias(args[2]) if len(args) > 2 else None,
+                                        routing,
+                                    )
+                                    action = "added"
+                                else:
+                                    changed_chat_id, changed_user_id = remove_chat_admin_db(conn, args[0], args[1], routing)
+                                    action = "removed"
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Chat admin <code>{html.escape(changed_user_id)}</code> {action} for chat <code>{html.escape(changed_chat_id)}</code>.",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
                     if command == "testsource":
                         if not args:
                             await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /testsource &lt;source_id&gt;")
@@ -4603,6 +5560,8 @@ async def run_admin_command_listener(
                             source = next((item for item in sources if item.get("id") == source_id), None)
                             if source is None:
                                 raise ValueError(f"source '{source_id}' not found")
+                            if not is_admin and is_private_source(source):
+                                raise ValueError(f"source '{source_id}' not found or unavailable")
                             entries = await validate_source_via_parser(client, source)
                             await send_telegram_message_chunks(client, telegram_token, reply_chat_id, format_source_preview(source, entries))
                         except Exception as exc:
@@ -4623,6 +5582,11 @@ async def run_admin_command_listener(
                             product_start = 2 if source_id else 1
                             product = " ".join(args[product_start:]).strip() or None
                             source = build_github_release_source(args[0], source_id, product)
+                            if not is_admin:
+                                if source["id"] in source_ids:
+                                    raise ValueError(f"source '{source['id']}' already exists; chat admins cannot overwrite sources")
+                                if is_private_source(source):
+                                    raise ValueError("chat admins cannot create private sources")
                             entries = await validate_source_via_parser(client, source)
                             preview = format_source_preview(source, entries)
                             with db_connect(db_path) as conn:
@@ -4631,7 +5595,7 @@ async def run_admin_command_listener(
                                     source,
                                     preview,
                                     message,
-                                    action="upsert",
+                                    action="upsert" if is_admin else "create",
                                 )
                             await send_telegram_message_chunks(
                                 client,
@@ -4652,10 +5616,15 @@ async def run_admin_command_listener(
                                 str(parsed_source_args["url"]),
                                 parsed_source_args["product"],
                             )
+                            if not is_admin:
+                                if source["id"] in source_ids:
+                                    raise ValueError(f"source '{source['id']}' already exists; chat admins cannot overwrite sources")
+                                if is_private_source(source):
+                                    raise ValueError("chat admins cannot create private sources")
                             entries = await validate_source_via_parser(client, source)
                             preview = format_source_preview(source, entries)
                             with db_connect(db_path) as conn:
-                                token = stage_pending_source_db(conn, source, preview, message, action="upsert")
+                                token = stage_pending_source_db(conn, source, preview, message, action="upsert" if is_admin else "create")
                             await send_telegram_message_chunks(
                                 client,
                                 telegram_token,
@@ -4668,7 +5637,11 @@ async def run_admin_command_listener(
 
                     if command == "pendingsources":
                         with db_connect(db_path) as conn:
-                            text = format_pending_sources_command(conn)
+                            text = format_pending_sources_command(
+                                conn,
+                                requested_by_user_id=None if is_admin else user_id,
+                                include_private=is_admin,
+                            )
                         await send_telegram_message_chunks(client, telegram_token, reply_chat_id, text)
                         continue
 
@@ -4678,17 +5651,25 @@ async def run_admin_command_listener(
                             continue
                         try:
                             token = args[0]
-                            if command == "confirmsource":
-                                with db_connect(db_path) as conn:
-                                    pending = conn.execute("SELECT source_id, config_yaml FROM pending_sources WHERE token = ?", (token,)).fetchone()
-                                if pending is None:
-                                    raise ValueError(f"pending source token '{token}' not found")
-                                await validate_source_via_parser(
-                                    client,
-                                    parse_source_config_text(pending["source_id"], pending["config_yaml"]),
-                                )
                             with db_connect(db_path) as conn:
-                                changed_source_id = apply_pending_source_db(conn, token) if command == "confirmsource" else reject_pending_source_db(conn, token)
+                                pending = conn.execute(
+                                    "SELECT source_id, config_yaml, requested_by_user_id FROM pending_sources WHERE token = ?",
+                                    (token,),
+                                ).fetchone()
+                            if pending is None:
+                                raise ValueError(f"pending source token '{token}' not found")
+                            pending_source = parse_source_config_text(pending["source_id"], pending["config_yaml"])
+                            if not is_admin:
+                                if user_id is None or pending["requested_by_user_id"] != user_id:
+                                    raise ValueError(f"pending source token '{token}' not found or unavailable")
+                                if command == "confirmsource" and is_private_source(pending_source):
+                                    raise ValueError("chat admins cannot apply private sources")
+                                if command == "confirmsource" and pending_source["id"] in source_ids:
+                                    raise ValueError(f"source '{pending_source['id']}' already exists; chat admins cannot overwrite sources")
+                            if command == "confirmsource":
+                                await validate_source_via_parser(client, pending_source)
+                            with db_connect(db_path) as conn:
+                                changed_source_id = apply_pending_source_db(conn, token, create_only=not is_admin) if command == "confirmsource" else reject_pending_source_db(conn, token)
                             if command == "confirmsource":
                                 reload_requested.set()
                                 action = "applied"
@@ -4727,6 +5708,25 @@ async def run_admin_command_listener(
                             await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
                         continue
 
+                    if command == "setsourceprivate":
+                        if len(args) < 2:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /setsourceprivate &lt;source_id&gt; &lt;on|off&gt;")
+                            continue
+                        try:
+                            private = parse_bool_value(args[1], "private", default=False)
+                            with db_connect(db_path) as conn:
+                                changed_source_id = set_source_private_db(conn, args[0], private)
+                            reload_requested.set()
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Source <code>{html.escape(changed_source_id)}</code> private={bool_status(private)}.",
+                            )
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
                     if command == "subscriptions":
                         target_chat_token = args[0] if args else reply_chat_id
                         target_chat_id = resolve_chat_identifier(target_chat_token, routing)
@@ -4738,11 +5738,24 @@ async def run_admin_command_listener(
                                 f"Chat <code>{html.escape(target_chat_token)}</code> not found.",
                             )
                             continue
+                        if not is_admin and target_chat_id not in allowed_chat_ids:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Чат <code>{html.escape(target_chat_token)}</code> недоступен для твоей роли.",
+                            )
+                            continue
                         await send_telegram_message_chunks(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            format_subscriptions_command(target_chat_id, routing),
+                            format_subscriptions_command(
+                                target_chat_id,
+                                routing,
+                                source_lookup=source_lookup,
+                                include_private=is_admin,
+                            ),
                         )
                         continue
 
@@ -4765,6 +5778,14 @@ async def run_admin_command_listener(
                                 f"Источник <code>{html.escape(source_id)}</code> отсутствует в runtime sources",
                             )
                             continue
+                        if not is_admin and is_private_source(source_lookup[source_id]):
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Источник <code>{html.escape(source_id)}</code> отсутствует в runtime sources",
+                            )
+                            continue
 
                         target_chat_token = reply_chat_id if command.endswith("_here") else (args[1] if len(args) > 1 else reply_chat_id)
                         target_chat_id = resolve_chat_identifier(target_chat_token, routing)
@@ -4774,6 +5795,14 @@ async def run_admin_command_listener(
                                 telegram_token,
                                 reply_chat_id,
                                 f"Чат <code>{html.escape(target_chat_token)}</code> не найден. Укажи chat_id или alias из routing DB.",
+                            )
+                            continue
+                        if not is_admin and target_chat_id not in allowed_chat_ids:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                "Укажи chat_id или alias одного из своих чатов.",
                             )
                             continue
 
@@ -4799,6 +5828,84 @@ async def run_admin_command_listener(
                         await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
                         continue
 
+                    if command == "channels":
+                        await send_telegram_message_chunks(client, telegram_token, reply_chat_id, format_channels_command(routing))
+                        continue
+
+                    if command == "channel":
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, "Usage: /channel &lt;channel&gt;")
+                            continue
+                        await send_telegram_message_chunks(
+                            client,
+                            telegram_token,
+                            reply_chat_id,
+                            format_channel_command(normalize_channel_name(args[0]), routing, source_lookup),
+                        )
+                        continue
+
+                    if command in {"addchannel", "removechannel"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;channel&gt;")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                result = add_channel_db(conn, args[0]) if command == "addchannel" else remove_channel_db(conn, args[0])
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command in {"channel_addsource", "channel_removesource"}:
+                        if len(args) < 2:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;channel&gt; &lt;source_id&gt;")
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                result = apply_channel_source_change_db(
+                                    conn,
+                                    args[0],
+                                    args[1],
+                                    add=command == "channel_addsource",
+                                )
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
+                    if command in {"channel_subscribe", "channel_unsubscribe", "channel_subscribe_here", "channel_unsubscribe_here"}:
+                        if not args:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, f"Usage: /{command} &lt;channel&gt; [chat_id|alias]")
+                            continue
+                        target_chat_token = reply_chat_id if command.endswith("_here") else (args[1] if len(args) > 1 else reply_chat_id)
+                        target_chat_id = resolve_chat_identifier(target_chat_token, routing)
+                        if target_chat_id is None:
+                            await send_telegram_message(
+                                client,
+                                telegram_token,
+                                reply_chat_id,
+                                f"Чат <code>{html.escape(target_chat_token)}</code> не найден. Укажи chat_id или alias из routing DB.",
+                            )
+                            continue
+                        try:
+                            with db_connect(db_path) as conn:
+                                result = apply_channel_subscription_change_db(
+                                    conn,
+                                    args[0],
+                                    target_chat_id,
+                                    add=command in {"channel_subscribe", "channel_subscribe_here"},
+                                )
+                            routing_state.get(source_ids, force_reload=True)
+                            reload_requested.set()
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html.escape(result))
+                        except Exception as exc:
+                            await send_telegram_message(client, telegram_token, reply_chat_id, html_escape_error(exc))
+                        continue
+
                     if command == "admins":
                         await send_telegram_message_chunks(
                             client,
@@ -4822,7 +5929,7 @@ async def run_admin_command_listener(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            format_sources_command(sources),
+                            format_sources_command(sources, include_private=is_admin),
                         )
                         continue
 
@@ -4839,7 +5946,13 @@ async def run_admin_command_listener(
                             client,
                             telegram_token,
                             reply_chat_id,
-                            format_source_details_command(normalize_source_id(args[0]), sources, routing),
+                            format_source_details_command(
+                                normalize_source_id(args[0]),
+                                sources,
+                                routing,
+                                visible_chat_ids=None if is_admin else allowed_chat_ids,
+                                include_private=is_admin,
+                            ),
                         )
                         continue
 
@@ -5458,6 +6571,8 @@ def validate_source_config(config: dict[str, Any]) -> set[str]:
 
         if source_type == "github_releases":
             github_repo_from_url(source_url)
+
+        is_private_source(source)
 
     return source_ids
 
