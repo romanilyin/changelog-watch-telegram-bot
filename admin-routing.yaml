@@ -21,6 +21,7 @@ chats:
       - unity
     sources:
       - codenomad_releases
+      - easyeda_copilot_releases
     send_summary: true
     summary_schedule:
       mode: immediate

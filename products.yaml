@@ -29,6 +29,14 @@ sources:
     post_on_first_run: false
     max_body_chars: 2500
 
+  - id: easyeda_copilot_releases
+    product: EasyEDA Copilot
+    type: github_releases
+    url: https://github.com/biosshot/easyeda-copilot/releases
+    include_prereleases: false
+    post_on_first_run: false
+    max_body_chars: 2500
+
   - id: unity_ivanmurzak_releases
     product: Unity-MCP (IvanMurzak)
     type: github_releases
