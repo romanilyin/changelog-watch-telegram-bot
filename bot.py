@@ -2331,6 +2331,7 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
             item_title TEXT NOT NULL,
             item_version TEXT NOT NULL,
             item_date TEXT,
+            item_body TEXT NOT NULL DEFAULT '',
             item_url TEXT NOT NULL,
             item_is_prerelease INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -2339,6 +2340,9 @@ def ensure_routing_columns(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    summary_queue_columns = table_columns(conn, "summary_queue")
+    if "item_body" not in summary_queue_columns:
+        conn.execute("ALTER TABLE summary_queue ADD COLUMN item_body TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_summary_queue_chat_id ON summary_queue(chat_id)")
 
     conn.execute(
@@ -3233,6 +3237,17 @@ def summary_matches_target_language(summary: str, target_language: str) -> bool:
     return True
 
 
+def summary_is_uninformative_no_notes(summary: str) -> bool:
+    normalized = re.sub(r"\s+", " ", summary).strip(" .!?").lower()
+    return normalized in {
+        "нет информации об изменениях",
+        "нет информации о изменениях",
+        "нет данных об изменениях",
+        "информация об изменениях отсутствует",
+        "описание изменений отсутствует",
+    }
+
+
 async def generate_ai_summary_with_model(
     client: httpx.AsyncClient,
     source: dict[str, Any],
@@ -3241,6 +3256,14 @@ async def generate_ai_summary_with_model(
 ) -> str | None:
     if _ai_summary_auth_requires_key(model.auth_type) and not model.api_key:
         LOG.warning("AI summary model %s skipped: missing API key", model.label)
+        return None
+    if not (entry.body or "").strip():
+        LOG.warning(
+            "AI summary model %s skipped for %s/%s: release notes body is empty",
+            model.label,
+            source["id"],
+            entry.item_id,
+        )
         return None
 
     payload = {
@@ -3357,6 +3380,14 @@ async def generate_ai_summary_with_model(
                 truncate(summary, 200),
             )
             return None
+        if summary_is_uninformative_no_notes(summary):
+            LOG.warning(
+                "AI summary model %s returned uninformative no-notes summary for %s/%s",
+                model.label,
+                source["id"],
+                entry.item_id,
+            )
+            return None
         return summary
 
     return None
@@ -3415,6 +3446,10 @@ async def get_or_generate_ai_summary(
 
         cached = load_ai_summary(conn, source["id"], entry.item_id, model.cache_key, model.target_language)
         if cached:
+            if summary_is_uninformative_no_notes(cached):
+                if cycle_cache is not None:
+                    cycle_cache[cache_key] = None
+                continue
             if cycle_cache is not None:
                 cycle_cache[cache_key] = cached
             return cached
@@ -3525,10 +3560,11 @@ def enqueue_summary_items(
             item_title,
             item_version,
             item_date,
+            item_body,
             item_url,
             item_is_prerelease,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -3538,6 +3574,7 @@ def enqueue_summary_items(
                 entry.title,
                 entry.version,
                 entry.date,
+                entry.body,
                 entry.url,
                 1 if entry.is_prerelease else 0,
                 now,
@@ -3571,7 +3608,7 @@ def load_summary_queue_items(
     cutoff = datetime.now(timezone.utc) - max_age if max_age is not None else None
     rows = conn.execute(
         """
-        SELECT source_id, item_id, item_title, item_version, item_date, item_url, item_is_prerelease, created_at
+        SELECT source_id, item_id, item_title, item_version, item_date, item_body, item_url, item_is_prerelease, created_at
         FROM summary_queue
         WHERE chat_id = ?
         ORDER BY created_at, rowid
@@ -3597,7 +3634,7 @@ def load_summary_queue_items(
                     title=row["item_title"],
                     version=row["item_version"],
                     date=row["item_date"],
-                    body="",
+                    body=row["item_body"] or "",
                     url=row["item_url"],
                     is_prerelease=bool(int(row["item_is_prerelease"])) if row["item_is_prerelease"] is not None else False,
                 ),
@@ -3633,6 +3670,25 @@ def clear_summary_queue_items(conn: sqlite3.Connection, chat_id: str, entries: l
     conn.executemany(
         "DELETE FROM summary_queue WHERE chat_id = ? AND source_id = ? AND item_id = ?",
         [(chat_id, source_id, entry.item_id) for source_id, entry in entries],
+    )
+    conn.commit()
+
+
+def update_summary_queue_item_body(
+    conn: sqlite3.Connection,
+    chat_id: str,
+    source_id: str,
+    entry: ChangelogEntry,
+) -> None:
+    if not entry.body:
+        return
+    conn.execute(
+        """
+        UPDATE summary_queue
+        SET item_body = ?
+        WHERE chat_id = ? AND source_id = ? AND item_id = ? AND COALESCE(item_body, '') = ''
+        """,
+        (entry.body, chat_id, source_id, entry.item_id),
     )
     conn.commit()
 
@@ -5028,6 +5084,7 @@ async def check_all(
         summary_items_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         instant_posts_by_chat: defaultdict[str, list[tuple[dict[str, Any], ChangelogEntry]]] = defaultdict(list)
         ai_summary_cycle_cache: dict[tuple[str, str, str, str], str | None] = {}
+        parsed_entries_by_key: dict[tuple[str, str], ChangelogEntry] = {}
 
         if not dry_run:
             chat_access = await validate_routing_chats(client, telegram_token, routing)
@@ -5067,6 +5124,8 @@ async def check_all(
                 source_entries, new_entries = await check_source(conn, client, source, dry_run=dry_run)
                 if not source_entries:
                     continue
+                for entry in source_entries:
+                    parsed_entries_by_key[(source["id"], entry.item_id)] = entry
 
                 for chat_id in target_chat_ids:
                     chat = routing.chats.get(chat_id)
@@ -5127,6 +5186,11 @@ async def check_all(
             if should_send_summary:
                 for source_id, entry in queued:
                     source = source_lookup.get(source_id, {"id": source_id})
+                    parsed_entry = parsed_entries_by_key.get((str(source_id), entry.item_id))
+                    if parsed_entry is not None and (not entry.body or parsed_entry.body):
+                        entry = parsed_entry
+                        if not dry_run:
+                            update_summary_queue_item_body(conn, chat.chat_id, str(source_id), entry)
                     seen_for_chat.add((str(source_id), entry.item_id))
                     entries_for_chat.append((source, entry))
 
