@@ -6156,7 +6156,7 @@ async def send_summary(
         LOG.info("%s", msg)
         return True
 
-    await send_telegram_message(client, telegram_token, chat_id, msg)
+    await send_telegram_message_chunks(client, telegram_token, chat_id, msg)
     return True
 
 
