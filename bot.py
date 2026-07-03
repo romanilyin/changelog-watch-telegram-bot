@@ -4944,6 +4944,14 @@ async def build_aggregate_summary(
     return "\n".join(lines)
 
 
+def raise_for_telegram_status(response: httpx.Response) -> None:
+    if not response.is_error:
+        return
+    url = mask_telegram_bot_token(str(response.request.url))
+    body = mask_telegram_bot_token(response.text[:500])
+    raise RuntimeError(f"Telegram HTTP {response.status_code} for {response.request.method} {url}: {body}")
+
+
 async def send_telegram_message(client: httpx.AsyncClient, token: str, chat_id: str, text: str) -> None:
     api_url = f"https://api.telegram.org/bot{token}/sendMessage"
     response = await client.post(
@@ -4955,7 +4963,7 @@ async def send_telegram_message(client: httpx.AsyncClient, token: str, chat_id: 
             "disable_web_page_preview": True,
         },
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 async def send_telegram_message_chunks(client: httpx.AsyncClient, token: str, chat_id: str, text: str) -> None:
@@ -4974,7 +4982,7 @@ async def telegram_api_get_result(
         f"https://api.telegram.org/bot{token}/{method}",
         params=params or {},
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
     payload = response.json()
     if not isinstance(payload, dict) or not payload.get("ok"):
         description = payload.get("description") if isinstance(payload, dict) else None
@@ -4993,7 +5001,7 @@ async def telegram_api_post_result(
         f"https://api.telegram.org/bot{token}/{method}",
         json=payload or {},
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
     result_payload = response.json()
     if not isinstance(result_payload, dict) or not result_payload.get("ok"):
         description = result_payload.get("description") if isinstance(result_payload, dict) else None
@@ -5258,7 +5266,7 @@ async def run_admin_command_listener(
                     is_chat_admin = bool(allowed_chat_ids)
 
                     if command in {"start", "help"}:
-                        await send_telegram_message(
+                        await send_telegram_message_chunks(
                             client,
                             telegram_token,
                             reply_chat_id,
